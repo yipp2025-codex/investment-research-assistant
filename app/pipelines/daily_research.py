@@ -194,6 +194,7 @@ class DailyResearchPipeline:
     def _fetch_with_retry(
         self, symbol: str, start_date: date, end_date: date
     ) -> tuple[MarketDataBatch, int]:
+        total_delay_seconds = 0.0
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             try:
                 batch = self.provider.fetch_market_data(
@@ -206,10 +207,15 @@ class DailyResearchPipeline:
             except ProviderTemporaryError as error:
                 if attempt >= self.retry_policy.max_attempts:
                     raise
-                delay = self.retry_policy.delay_after_failure(attempt)
-                if error.retry_after_seconds is not None:
-                    delay = max(delay, error.retry_after_seconds)
+                delay = self.retry_policy.next_delay(
+                    attempt,
+                    retry_after_seconds=error.retry_after_seconds,
+                    total_delay_seconds=total_delay_seconds,
+                )
+                if delay is None:
+                    raise
                 self.sleep(delay)
+                total_delay_seconds += delay
         raise AssertionError("retry loop ended without a result")  # pragma: no cover
 
     def _load_successful_run(self, run: PipelineRun) -> PipelineResult:

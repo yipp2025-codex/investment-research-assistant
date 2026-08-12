@@ -20,6 +20,7 @@ from app.providers.twse import (
     BWIBBU_ALL_URL,
     STOCK_DAY_ALL_URL,
     TwseHttpResponse,
+    UrllibTwseHttpTransport,
 )
 from app.storage import SQLiteResearchRepository
 
@@ -56,6 +57,52 @@ class StubTransport:
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
+
+
+class _OversizedHttpResponse:
+    status = 200
+    headers = {
+        "Content-Type": "application/json",
+        "Content-Length": "999999999",
+    }
+
+    def __init__(self) -> None:
+        self.read_called = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        del size
+        self.read_called = True
+        return b"{}"
+
+    @staticmethod
+    def geturl() -> str:
+        return STOCK_DAY_ALL_URL
+
+
+class _SingleResponseOpener:
+    def __init__(self, response: _OversizedHttpResponse) -> None:
+        self.response = response
+
+    def open(self, request, *, timeout):
+        del request, timeout
+        return self.response
+
+
+def test_twse_transport_rejects_oversized_content_length_before_read() -> None:
+    response = _OversizedHttpResponse()
+    transport = UrllibTwseHttpTransport()
+    transport._opener = _SingleResponseOpener(response)
+
+    with pytest.raises(ProviderInvalidPayloadError, match="exceeds"):
+        transport.get(STOCK_DAY_ALL_URL, timeout_seconds=1.0)
+
+    assert response.read_called is False
 
 
 def _provider(transport: StubTransport | None = None) -> TwseMarketDataProvider:

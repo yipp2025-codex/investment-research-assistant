@@ -10,6 +10,7 @@ from app.providers import (
     MockFailureMode,
     MockMarketDataProvider,
     ProviderPermanentError,
+    ProviderTemporaryError,
 )
 from app.storage import (
     PipelineRunConflictError,
@@ -83,6 +84,76 @@ def test_provider_temporary_failure_retries_then_succeeds_without_sleep(tmp_path
     assert provider.timeout_history == [1.5, 1.5]
     assert delays == [0.25]
     assert len(repository.list_research_notes("MOCK1")) == 1
+
+
+def test_daily_pipeline_caps_extreme_provider_retry_after(tmp_path) -> None:
+    class RetryAfterProvider(MockMarketDataProvider):
+        def fetch_market_data(
+            self, symbol, start_date, end_date, *, timeout_seconds
+        ):
+            if self.call_count == 0:
+                self.call_count += 1
+                self.timeout_history.append(timeout_seconds)
+                raise ProviderTemporaryError(
+                    "paced", retry_after_seconds=1_000_000_000
+                )
+            return super().fetch_market_data(
+                symbol,
+                start_date,
+                end_date,
+                timeout_seconds=timeout_seconds,
+            )
+
+    repository = SQLiteResearchRepository(tmp_path / "research.db")
+    provider = RetryAfterProvider()
+    delays: list[float] = []
+    pipeline = DailyResearchPipeline(
+        provider,
+        repository,
+        retry_policy=RetryPolicy(max_attempts=2, initial_backoff_seconds=0.25),
+        sleep=delays.append,
+    )
+
+    result = pipeline.run("MOCK1", START, END)
+
+    assert result.run_status is PipelineRunStatus.SUCCESS
+    assert delays == [60.0]
+
+
+def test_daily_pipeline_stops_when_total_retry_delay_budget_is_exhausted(
+    tmp_path,
+) -> None:
+    class AlwaysPacedProvider(MockMarketDataProvider):
+        def fetch_market_data(
+            self, symbol, start_date, end_date, *, timeout_seconds
+        ):
+            del symbol, start_date, end_date
+            self.call_count += 1
+            self.timeout_history.append(timeout_seconds)
+            raise ProviderTemporaryError(
+                "paced", retry_after_seconds=1_000_000_000
+            )
+
+    repository = SQLiteResearchRepository(tmp_path / "research.db")
+    provider = AlwaysPacedProvider()
+    delays: list[float] = []
+    pipeline = DailyResearchPipeline(
+        provider,
+        repository,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_backoff_seconds=0.25,
+            max_delay_seconds=60.0,
+            max_total_delay_seconds=60.0,
+        ),
+        sleep=delays.append,
+    )
+
+    with pytest.raises(ProviderTemporaryError, match="paced"):
+        pipeline.run("MOCK1", START, END)
+
+    assert provider.call_count == 2
+    assert delays == [60.0]
 
 
 def test_provider_permanent_failure_marks_run_failed_without_retry(tmp_path) -> None:

@@ -56,6 +56,8 @@ The pytest suite uses local fixtures and synthetic inputs. Any command prefixed 
 - `benchmarks/`: reproducible benchmark programs; machine-specific result snapshots are not included
 - `docs/`: provider contract notes for official data boundaries
 
-## Publication status
+## License and attribution
 
-No license has been selected. Do not assume permission to copy, modify, or redistribute this code until a license is added by the maintainers.
+This project is available under the [MIT License](LICENSE).
+
+If you use this project in research, articles, reports, or derivative projects, attribution to the original repository is appreciated. This citation request is voluntary and does not add conditions beyond the MIT License.

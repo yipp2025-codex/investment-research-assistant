@@ -180,6 +180,7 @@ class MarketDataCrossValidationPipeline:
         start_date: date,
         target_date: date,
     ) -> tuple[MarketDataBatch, int]:
+        total_delay_seconds = 0.0
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             try:
                 return (
@@ -194,7 +195,14 @@ class MarketDataCrossValidationPipeline:
             except ProviderTemporaryError:
                 if attempt >= self.retry_policy.max_attempts:
                     raise
-                self.sleep(self.retry_policy.delay_after_failure(attempt))
+                delay = self.retry_policy.next_delay(
+                    attempt,
+                    total_delay_seconds=total_delay_seconds,
+                )
+                if delay is None:
+                    raise
+                self.sleep(delay)
+                total_delay_seconds += delay
         raise AssertionError("retry loop ended without a result")  # pragma: no cover
 
     def _observation(

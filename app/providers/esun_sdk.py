@@ -21,11 +21,13 @@ from .base import (
     ProviderTemporaryError,
     ProviderTimeoutError,
 )
+from ._http_response import read_bounded_response_body
 
 
 VERIFIED_ESUN_SDK_VERSION = "2.2.0"
 _ALLOWED_REST_HOSTS = frozenset({"api.fugle.tw"})
 _EXPECTED_REST_PATH_PREFIX = "/marketdata/v1.0/stock"
+ESUN_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +50,14 @@ class EsunHttpTransport(Protocol):
         """Perform exactly one authenticated, read-only HTTP GET."""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep authenticated redirects visible so the transport can reject them."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 class EsunSdkHttpTransport:
     """Use SDK 2.2.0 only for login/token exchange, then bounded HTTP GETs."""
 
@@ -56,11 +66,10 @@ class EsunSdkHttpTransport:
         config_path: str | Path,
         *,
         clock: Callable[[], datetime] | None = None,
-        opener: Callable[..., object] | None = None,
     ) -> None:
         self.config_path = Path(config_path).expanduser()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
-        self._opener = opener or urllib.request.urlopen
+        self._opener = urllib.request.build_opener(_NoRedirectHandler()).open
         self._base_url: str | None = None
         self._sdk_token: str | None = None
         self._authentication_lock = Lock()
@@ -101,21 +110,33 @@ class EsunSdkHttpTransport:
         )
         try:
             with self._opener(request, timeout=timeout_seconds) as response:
+                effective_url = self._verified_effective_url(response, url)
                 return EsunHttpResponse(
                     status_code=int(response.status),
-                    body=response.read(),
+                    body=read_bounded_response_body(
+                        response,
+                        max_bytes=ESUN_MAX_RESPONSE_BYTES,
+                        timeout_seconds=timeout_seconds,
+                        source_name="E.SUN market-data",
+                    ),
                     headers={
                         key.lower(): value for key, value in response.headers.items()
                     },
-                    url=url,
+                    url=effective_url,
                     fetched_at=self._aware_now(),
                 )
         except urllib.error.HTTPError as error:
+            effective_url = self._verified_effective_url(error, url)
             return EsunHttpResponse(
                 status_code=int(error.code),
-                body=error.read(),
+                body=read_bounded_response_body(
+                    error,
+                    max_bytes=ESUN_MAX_RESPONSE_BYTES,
+                    timeout_seconds=timeout_seconds,
+                    source_name="E.SUN market-data",
+                ),
                 headers={key.lower(): value for key, value in error.headers.items()},
-                url=url,
+                url=effective_url,
                 fetched_at=self._aware_now(),
             )
         except (TimeoutError, socket.timeout) as error:
@@ -255,10 +276,17 @@ class EsunSdkHttpTransport:
                 "E.SUN SDK authentication failed"
             ) from None
 
-        parsed = urllib.parse.urlsplit(base_url)
+        try:
+            parsed = urllib.parse.urlsplit(base_url)
+            port = parsed.port
+        except ValueError:
+            raise ProviderPermanentError(
+                "E.SUN SDK returned an unverified market-data REST URL"
+            ) from None
         if (
             parsed.scheme != "https"
             or parsed.hostname not in _ALLOWED_REST_HOSTS
+            or port not in (None, 443)
             or parsed.path.rstrip("/") != _EXPECTED_REST_PATH_PREFIX
             or parsed.username is not None
             or parsed.password is not None
@@ -274,6 +302,25 @@ class EsunSdkHttpTransport:
             )
         self._base_url = base_url
         self._sdk_token = sdk_token
+
+    @staticmethod
+    def _verified_effective_url(response: object, requested_url: str) -> str:
+        geturl = getattr(response, "geturl", None)
+        if not callable(geturl):
+            raise ProviderPermanentError(
+                "E.SUN market-data redirect state could not be verified"
+            )
+        try:
+            effective_url = geturl()
+        except Exception:
+            raise ProviderPermanentError(
+                "E.SUN market-data redirect state could not be verified"
+            ) from None
+        if not isinstance(effective_url, str) or effective_url != requested_url:
+            raise ProviderPermanentError(
+                "E.SUN market-data redirect is not allowed"
+            )
+        return effective_url
 
     def _aware_now(self) -> datetime:
         now = self.clock()

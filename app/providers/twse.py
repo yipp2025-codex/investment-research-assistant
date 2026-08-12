@@ -24,6 +24,7 @@ from .base import (
     ProviderTimeoutError,
 )
 from .artifacts import source_artifact_from_bytes
+from ._http_response import read_bounded_response_body
 
 
 TWSE_BASE_URL = "https://openapi.twse.com.tw/v1"
@@ -31,6 +32,7 @@ STOCK_DAY_ALL_PATH = "/exchangeReport/STOCK_DAY_ALL"
 BWIBBU_ALL_PATH = "/exchangeReport/BWIBBU_ALL"
 STOCK_DAY_ALL_URL = TWSE_BASE_URL + STOCK_DAY_ALL_PATH
 BWIBBU_ALL_URL = TWSE_BASE_URL + BWIBBU_ALL_PATH
+TWSE_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 _COMMON_STOCK_CODE = re.compile(r"^[0-9]{4}$")
 _ROC_DATE = re.compile(r"^[0-9]{7}$")
@@ -97,14 +99,24 @@ class UrllibTwseHttpTransport:
             with self._opener.open(request, timeout=timeout_seconds) as response:
                 return TwseHttpResponse(
                     status_code=int(response.status),
-                    body=response.read(),
+                    body=read_bounded_response_body(
+                        response,
+                        max_bytes=TWSE_MAX_RESPONSE_BYTES,
+                        timeout_seconds=timeout_seconds,
+                        source_name="TWSE OpenAPI",
+                    ),
                     headers={key.lower(): value for key, value in response.headers.items()},
                     effective_url=response.geturl(),
                 )
         except urllib.error.HTTPError as error:
             return TwseHttpResponse(
                 status_code=int(error.code),
-                body=error.read(),
+                body=read_bounded_response_body(
+                    error,
+                    max_bytes=TWSE_MAX_RESPONSE_BYTES,
+                    timeout_seconds=timeout_seconds,
+                    source_name="TWSE OpenAPI",
+                ),
                 headers={key.lower(): value for key, value in error.headers.items()},
                 effective_url=error.geturl(),
             )

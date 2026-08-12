@@ -331,6 +331,25 @@ def test_historical_sync_honors_provider_retry_after(tmp_path) -> None:
     assert delays == [3.5]
 
 
+def test_historical_sync_caps_extreme_provider_retry_after(tmp_path) -> None:
+    repository = _repository(tmp_path)
+    provider = SyntheticHistoricalProvider(
+        [ProviderTemporaryError("paced", retry_after_seconds=1_000_000_000), None]
+    )
+    delays: list[float] = []
+    pipeline = HistoricalSyncPipeline(
+        provider,
+        repository,
+        retry_policy=RetryPolicy(max_attempts=2, initial_backoff_seconds=0.25),
+        sleep=delays.append,
+    )
+
+    result = pipeline.run("2330", TARGET_DATE, target_observations=60)
+
+    assert result.run_status is PipelineRunStatus.SUCCESS
+    assert delays == [60.0]
+
+
 def test_historical_month_sqlite_failure_rolls_back_and_retry_resumes_cursor(
     tmp_path,
 ) -> None:
