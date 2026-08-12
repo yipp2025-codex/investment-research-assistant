@@ -1,0 +1,22 @@
+{
+  "date": "2026-08-06",
+  "type": "EQUITY",
+  "exchange": "TWSE",
+  "market": "TSE",
+  "symbol": "2330",
+  "name": "台積電",
+  "openPrice": 2395,
+  "highPrice": 2395,
+  "lowPrice": 2360,
+  "closePrice": 2365,
+  "lastUpdated": 1785994200000000,
+  "isClose": true,
+  "total": {
+    "tradeValue": 54020260000,
+    "tradeVolume": 22760,
+    "tradeVolumeAtBid": 13073,
+    "tradeVolumeAtAsk": 7557,
+    "transaction": 6665,
+    "time": 1785994200000000
+  }
+}

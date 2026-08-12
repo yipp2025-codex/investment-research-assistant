@@ -1,0 +1,5 @@
+{
+  "status": 429,
+  "message": "Rate limit exceeded",
+  "error": "Too Many Requests"
+}

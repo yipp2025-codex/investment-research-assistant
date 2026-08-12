@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "investment-research-assistant"
+version = "1.0.0"
+description = "Broker-independent market research and risk analysis pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["tzdata>=2024.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+investment-research = "app.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+"app.storage" = ["schema.sql", "migrations/*.sql"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

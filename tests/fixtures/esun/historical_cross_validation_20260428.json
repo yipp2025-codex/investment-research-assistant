@@ -1,0 +1,38 @@
+{
+  "captured_at": "2026-08-06",
+  "trade_date": "2026-04-28",
+  "sources": [
+    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
+    "/historical/candles/{symbol}"
+  ],
+  "classification": "volume_definition_or_source_revision_unresolved",
+  "rows": [
+    {
+      "symbol": "2330",
+      "open": 2245,
+      "high": 2280,
+      "low": 2215,
+      "close": 2215,
+      "twse_volume": 57336004,
+      "esun_volume": 53038648
+    },
+    {
+      "symbol": "2317",
+      "open": 230,
+      "high": 234,
+      "low": 225,
+      "close": 225.5,
+      "twse_volume": 104089860,
+      "esun_volume": 103741860
+    },
+    {
+      "symbol": "2454",
+      "open": 2490,
+      "high": 2675,
+      "low": 2485,
+      "close": 2615,
+      "twse_volume": 24314216,
+      "esun_volume": 24102216
+    }
+  ]
+}

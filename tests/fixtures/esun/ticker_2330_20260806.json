@@ -1,0 +1,12 @@
+{
+  "date": "2026-08-06",
+  "type": "EQUITY",
+  "exchange": "TWSE",
+  "market": "TSE",
+  "symbol": "2330",
+  "name": "台積電",
+  "securityType": "01",
+  "securityStatus": "NORMAL",
+  "tradingCurrency": "TWD",
+  "boardLot": 1000
+}

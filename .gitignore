@@ -1,0 +1,52 @@
+# Local secrets and provider credentials
+.env
+.env.*
+!.env.example
+*.ini
+*.ini.*
+*.p12
+*.pfx
+*.pem
+*.key
+*marketdata*.whl
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.tmp-pytest*/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Local databases, reports, runtime state, and backups
+data/*
+!data/.gitkeep
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+reports/
+runtime/
+artifacts/
+backups/
+*.bak
+*.backup
+*.lock
+*.log
+*.tmp
+.activation-*/
+.remediation-*/
+
+# Machine-specific benchmark output
+benchmarks/results/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

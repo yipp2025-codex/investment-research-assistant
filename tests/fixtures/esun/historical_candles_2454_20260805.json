@@ -1,0 +1,40 @@
+{
+  "type": "EQUITY",
+  "exchange": "TWSE",
+  "market": "TSE",
+  "symbol": "2454",
+  "timeframe": "D",
+  "sort": "desc",
+  "data": [
+    {
+      "date": "2026-08-05",
+      "open": 4095,
+      "high": 4125,
+      "low": 3980,
+      "close": 4000,
+      "volume": 12935125,
+      "turnover": 52565983817,
+      "change": 135
+    },
+    {
+      "date": "2026-08-04",
+      "open": 4095,
+      "high": 4095,
+      "low": 3800,
+      "close": 3865,
+      "volume": 17318591,
+      "turnover": 67643468265,
+      "change": -45
+    },
+    {
+      "date": "2026-08-03",
+      "open": 3910,
+      "high": 3910,
+      "low": 3780,
+      "close": 3910,
+      "volume": 7516212,
+      "turnover": 29287630390,
+      "change": 355
+    }
+  ]
+}
