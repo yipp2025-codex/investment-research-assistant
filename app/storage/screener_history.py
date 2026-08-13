@@ -50,6 +50,27 @@ class DailyCandidateRecord:
     data_quality_status: str
     validation_status: str
     analysis_status: str
+    research_data_quality: str = "canonical"
+    execution_status: str = "success"
+    dataset_version_id: str | None = None
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    supplemental_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DataQualityFrequencyRecord:
+    """Aggregated historical DS5 quality/status visibility for sealed runs."""
+
+    market_date: date
+    research_data_quality: str
+    execution_status: str
+    run_count: int
+    candidate_count: int
+    supplemental_candidate_count: int
+    pending_reconciliation_count: int
+    discrepancy_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +213,7 @@ class SQLiteScreenerHistoryReader:
         if run_id is not None:
             clauses.append("run.screener_run_id = ?")
             parameters.append(run_id)
-        sql = (
+        base_select = (
             "SELECT run.market_date, run.screener_run_id, "
             "run.stage1_methodology_version, run.stage2_methodology_version, "
             "candidate.candidate_id, candidate.symbol, candidate.rank, "
@@ -200,7 +221,17 @@ class SQLiteScreenerHistoryReader:
             "candidate.stage1_trigger_count, candidate.stage1_reason_count, "
             "candidate.stage2_reason_count, candidate.data_quality_status, "
             "candidate.validation_status, candidate.analysis_status "
-            "FROM screener_runs AS run JOIN screener_candidates AS candidate "
+        )
+        ds5_select = (
+            ", run.ds5_research_data_quality, run.ds5_execution_status, "
+            "candidate.ds5_dataset_version_id, run.ds5_source_status, "
+            "run.ds5_authority_status, run.ds5_reconciliation_status, "
+            "candidate.ds5_esun_supplemental_count "
+        )
+        sql = (
+            base_select
+            + (ds5_select if self._supports_ds5_columns() else "")
+            + "FROM screener_runs AS run JOIN screener_candidates AS candidate "
             "ON candidate.screener_run_id = run.screener_run_id WHERE "
             + " AND ".join(clauses)
             + " ORDER BY run.stage1_methodology_version, "
@@ -227,9 +258,203 @@ class SQLiteScreenerHistoryReader:
                 data_quality_status=row["data_quality_status"],
                 validation_status=row["validation_status"],
                 analysis_status=row["analysis_status"],
+                research_data_quality=(
+                    row["ds5_research_data_quality"]
+                    if "ds5_research_data_quality" in row.keys()
+                    else "canonical"
+                ),
+                execution_status=(
+                    row["ds5_execution_status"]
+                    if "ds5_execution_status" in row.keys()
+                    else "success"
+                ),
+                dataset_version_id=(
+                    row["ds5_dataset_version_id"]
+                    if "ds5_dataset_version_id" in row.keys()
+                    else None
+                ),
+                source_status=(
+                    row["ds5_source_status"]
+                    if "ds5_source_status" in row.keys()
+                    else "canonical_complete"
+                ),
+                authority_status=(
+                    row["ds5_authority_status"]
+                    if "ds5_authority_status" in row.keys()
+                    else "complete"
+                ),
+                reconciliation_status=(
+                    row["ds5_reconciliation_status"]
+                    if "ds5_reconciliation_status" in row.keys()
+                    else "not_applicable"
+                ),
+                supplemental_count=(
+                    row["ds5_esun_supplemental_count"]
+                    if "ds5_esun_supplemental_count" in row.keys()
+                    else 0
+                ),
             )
             for row in rows
         )
+
+    def _supports_ds5_columns(self) -> bool:
+        with self._read_connection() as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info('screener_runs')")
+            }
+        return "ds5_research_data_quality" in columns
+
+    def quality_frequency(
+        self,
+        market_date: date | None = None,
+    ) -> tuple[DataQualityFrequencyRecord, ...]:
+        """Return sealed-run quality aggregates without changing legacy rows."""
+
+        if market_date is not None and not isinstance(market_date, date):
+            raise ScreenerHistoryError("market_date must be a date or None")
+        clauses = ["status = 'success'"]
+        parameters: list[object] = []
+        if market_date is not None:
+            clauses.append("market_date = ?")
+            parameters.append(_date_text(market_date))
+        with self._read_connection() as connection:
+            self._require_v11(connection)
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info('screener_runs')")
+            }
+            if "ds5_research_data_quality" in columns:
+                sql = (
+                    "SELECT market_date, ds5_research_data_quality AS research_data_quality, "
+                    "ds5_execution_status AS execution_status, COUNT(*) AS run_count, "
+                    "COALESCE(SUM(candidate_count), 0) AS candidate_count, "
+                    "COALESCE(SUM(ds5_supplemental_candidate_count), 0) AS supplemental_candidate_count, "
+                    "COALESCE(SUM(CASE WHEN ds5_reconciliation_status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_reconciliation_count, "
+                    "COALESCE(SUM(ds5_discrepancy_count), 0) AS discrepancy_count "
+                    "FROM screener_runs WHERE "
+                    + " AND ".join(clauses)
+                    + " GROUP BY market_date, ds5_research_data_quality, ds5_execution_status "
+                    "ORDER BY market_date, ds5_research_data_quality, ds5_execution_status"
+                )
+            else:
+                sql = (
+                    "SELECT market_date, 'canonical' AS research_data_quality, "
+                    "'success' AS execution_status, COUNT(*) AS run_count, "
+                    "COALESCE(SUM(candidate_count), 0) AS candidate_count, 0 AS supplemental_candidate_count, "
+                    "0 AS pending_reconciliation_count, 0 AS discrepancy_count "
+                    "FROM screener_runs WHERE "
+                    + " AND ".join(clauses)
+                    + " GROUP BY market_date ORDER BY market_date"
+                )
+            rows = connection.execute(sql, parameters).fetchall()
+        return tuple(
+            DataQualityFrequencyRecord(
+                market_date=date.fromisoformat(row["market_date"]),
+                research_data_quality=row["research_data_quality"],
+                execution_status=row["execution_status"],
+                run_count=int(row["run_count"]),
+                candidate_count=int(row["candidate_count"]),
+                supplemental_candidate_count=int(row["supplemental_candidate_count"]),
+                pending_reconciliation_count=int(row["pending_reconciliation_count"]),
+                discrepancy_count=int(row["discrepancy_count"]),
+            )
+            for row in rows
+        )
+
+    data_quality_frequency = quality_frequency
+
+    def supplemental_candidate_count(
+        self,
+        market_date: date,
+        *,
+        screener_run_id: str | None = None,
+    ) -> int:
+        """Return the number of sealed candidates using supplemental rows."""
+
+        return self._quality_count(
+            market_date,
+            column="ds5_supplemental_candidate_count",
+            screener_run_id=screener_run_id,
+        )
+
+    def pending_reconciliation_count(
+        self,
+        market_date: date,
+        *,
+        screener_run_id: str | None = None,
+    ) -> int:
+        """Return sealed runs whose dataset reconciliation remains pending."""
+
+        if not isinstance(market_date, date):
+            raise ScreenerHistoryError("market_date must be a date")
+        clauses = ["status = 'success'", "market_date = ?"]
+        parameters: list[object] = [_date_text(market_date)]
+        if screener_run_id is not None:
+            clauses.append("screener_run_id = ?")
+            parameters.append(_optional_text(screener_run_id, "screener_run_id"))
+        with self._read_connection() as connection:
+            self._require_v11(connection)
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info('screener_runs')")
+            }
+            if "ds5_reconciliation_status" not in columns:
+                return 0
+            row = connection.execute(
+                "SELECT COUNT(*) FROM screener_runs WHERE "
+                + " AND ".join(clauses)
+                + " AND ds5_reconciliation_status = 'pending'",
+                parameters,
+            ).fetchone()
+        return int(row[0])
+
+    def discrepancy_count(
+        self,
+        market_date: date,
+        *,
+        screener_run_id: str | None = None,
+    ) -> int:
+        """Return the persisted DS5 discrepancy total for sealed runs."""
+
+        return self._quality_count(
+            market_date,
+            column="ds5_discrepancy_count",
+            screener_run_id=screener_run_id,
+        )
+
+    def _quality_count(
+        self,
+        market_date: date,
+        *,
+        column: str,
+        screener_run_id: str | None,
+    ) -> int:
+        if not isinstance(market_date, date):
+            raise ScreenerHistoryError("market_date must be a date")
+        if column not in {
+            "ds5_supplemental_candidate_count",
+            "ds5_discrepancy_count",
+        }:
+            raise ScreenerHistoryError("unsupported quality aggregate")
+        clauses = ["status = 'success'", "market_date = ?"]
+        parameters: list[object] = [_date_text(market_date)]
+        if screener_run_id is not None:
+            clauses.append("screener_run_id = ?")
+            parameters.append(_optional_text(screener_run_id, "screener_run_id"))
+        with self._read_connection() as connection:
+            self._require_v11(connection)
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info('screener_runs')")
+            }
+            if column not in columns:
+                return 0
+            row = connection.execute(
+                f"SELECT COALESCE(SUM({column}), 0) FROM screener_runs WHERE "
+                + " AND ".join(clauses),
+                parameters,
+            ).fetchone()
+        return int(row[0])
 
     def reason_history(
         self,

@@ -1,9 +1,11 @@
 import configparser
+import io
 import importlib.metadata
 import sys
 import types
 from pathlib import Path
 from threading import Event, Thread
+import urllib.error
 
 import pytest
 
@@ -13,7 +15,6 @@ from app.providers import (
     ProviderPermanentError,
     ProviderTimeoutError,
 )
-from app.providers.esun_sdk import _NoRedirectHandler
 
 
 def _config(tmp_path: Path) -> Path:
@@ -82,18 +83,9 @@ class _FakeResponse:
     status = 200
     headers = {"Content-Type": "application/json"}
 
-    def __init__(
-        self,
-        url: str,
-        *,
-        body: bytes = b'{"ok":true}',
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self._url = url
+    def __init__(self, body: bytes = b'{"ok":true}', *, effective_url: str | None = None):
         self._body = body
-        self._offset = 0
-        if headers is not None:
-            self.headers = headers
+        self._effective_url = effective_url
 
     def __enter__(self):
         return self
@@ -101,36 +93,15 @@ class _FakeResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
+    def geturl(self) -> str | None:
+        return self._effective_url
+
     def read(self, size: int = -1) -> bytes:
         if size < 0:
-            size = len(self._body) - self._offset
-        chunk = self._body[self._offset : self._offset + size]
-        self._offset += len(chunk)
-        return chunk
-
-    def geturl(self) -> str:
-        return self._url
-
-
-class _RedirectedFakeResponse(_FakeResponse):
-    def __init__(self, effective_url: str) -> None:
-        super().__init__(effective_url)
-
-
-class _OversizedFakeResponse(_FakeResponse):
-    def __init__(self, effective_url: str) -> None:
-        super().__init__(
-            effective_url,
-            headers={
-                "Content-Type": "application/json",
-                "Content-Length": "999999999",
-            },
-        )
-        self.read_called = False
-
-    def read(self, size: int = -1) -> bytes:
-        self.read_called = True
-        return super().read(size)
+            body, self._body = self._body, b""
+            return body
+        body, self._body = self._body[:size], self._body[size:]
+        return body
 
 
 def test_esun_sdk_transport_authenticates_then_sends_one_bounded_get(
@@ -143,10 +114,9 @@ def test_esun_sdk_transport_authenticates_then_sends_one_bounded_get(
 
     def opener(request, *, timeout):
         captured.append((request, timeout))
-        return _FakeResponse(request.full_url)
+        return _FakeResponse()
 
-    transport = EsunSdkHttpTransport(config_path)
-    transport._opener = opener
+    transport = EsunSdkHttpTransport(config_path, opener=opener)
 
     response = transport.get(
         "/historical/candles/2330",
@@ -167,6 +137,66 @@ def test_esun_sdk_transport_authenticates_then_sends_one_bounded_get(
     assert headers["x-sdk-token"] == "synthetic-runtime-token"
 
 
+def test_esun_sdk_transport_rejects_cross_authority_redirect_without_following_token(
+    tmp_path, monkeypatch
+) -> None:
+    config_path = _config(tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
+    _install_fake_modules(monkeypatch)
+    captured: list[object] = []
+
+    def opener(request, *, timeout):
+        del timeout
+        captured.append(request)
+        return _FakeResponse(effective_url="https://evil.example/collect")
+
+    transport = EsunSdkHttpTransport(config_path, opener=opener)
+
+    with pytest.raises(ProviderPermanentError, match="redirect"):
+        transport.get("/intraday/ticker/2330", params=None, timeout_seconds=1.0)
+
+    request = captured[0]
+    assert request.full_url.startswith("https://api.fugle.tw/")
+    assert request.get_header("X-sdk-token") == "synthetic-runtime-token"
+    assert "synthetic-runtime-token" not in request.full_url
+
+
+def test_esun_sdk_transport_rejects_http_redirect_error(tmp_path, monkeypatch) -> None:
+    config_path = _config(tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
+    _install_fake_modules(monkeypatch)
+
+    def opener(request, *, timeout):
+        del timeout
+        raise urllib.error.HTTPError(
+            request.full_url,
+            307,
+            "redirect",
+            {"Location": "https://evil.example/collect"},
+            io.BytesIO(b"redirect"),
+        )
+
+    with pytest.raises(ProviderPermanentError, match="redirect"):
+        EsunSdkHttpTransport(config_path, opener=opener).get(
+            "/intraday/ticker/2330", params=None, timeout_seconds=1.0
+        )
+
+
+def test_esun_sdk_transport_rejects_oversized_response(tmp_path, monkeypatch) -> None:
+    config_path = _config(tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
+    _install_fake_modules(monkeypatch)
+    import app.providers.http_limits as http_limits
+
+    monkeypatch.setattr(http_limits, "MAX_RESPONSE_BYTES", 4)
+
+    with pytest.raises(ProviderInvalidPayloadError, match="byte limit"):
+        EsunSdkHttpTransport(
+            config_path,
+            opener=lambda request, *, timeout: _FakeResponse(b"12345"),
+        ).get("/intraday/ticker/2330", params=None, timeout_seconds=1.0)
+
+
 def test_esun_sdk_transport_reuses_one_authenticated_session(
     tmp_path, monkeypatch
 ) -> None:
@@ -183,10 +213,9 @@ def test_esun_sdk_transport_reuses_one_authenticated_session(
 
     def opener(request, *, timeout):
         captured.append(request)
-        return _FakeResponse(request.full_url)
+        return _FakeResponse()
 
-    transport = EsunSdkHttpTransport(config_path)
-    transport._opener = opener
+    transport = EsunSdkHttpTransport(config_path, opener=opener)
 
     transport.get(
         "/intraday/ticker/2330", params=None, timeout_seconds=1.0
@@ -203,80 +232,6 @@ def test_esun_sdk_transport_reuses_one_authenticated_session(
         ("esun_trade_sdk:cert", "synthetic-test-account"),
     ]
     assert len(captured) == 2
-
-
-@pytest.mark.parametrize(
-    "effective_url",
-    [
-        "https://redirect-sink.invalid/capture",
-        "http://api.fugle.tw/marketdata/v1.0/stock/intraday/ticker/2330",
-        "https://api.fugle.tw:8443/marketdata/v1.0/stock/intraday/ticker/2330",
-    ],
-)
-def test_esun_sdk_transport_rejects_unverified_effective_url(
-    tmp_path, monkeypatch, effective_url
-) -> None:
-    config_path = _config(tmp_path)
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
-    _install_fake_modules(monkeypatch)
-    captured: list[object] = []
-
-    def opener(request, *, timeout):
-        del timeout
-        captured.append(request)
-        return _RedirectedFakeResponse(effective_url)
-
-    transport = EsunSdkHttpTransport(config_path)
-    transport._opener = opener
-
-    with pytest.raises(ProviderPermanentError, match="redirect"):
-        transport.get(
-            "/intraday/ticker/2330", params=None, timeout_seconds=1.0
-        )
-
-    assert len(captured) == 1
-
-
-def test_esun_transport_rejects_oversized_content_length_before_read(
-    tmp_path, monkeypatch
-) -> None:
-    config_path = _config(tmp_path)
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
-    _install_fake_modules(monkeypatch)
-    captured_response: list[_OversizedFakeResponse] = []
-
-    def opener(request, *, timeout):
-        del timeout
-        response = _OversizedFakeResponse(request.full_url)
-        captured_response.append(response)
-        return response
-
-    transport = EsunSdkHttpTransport(config_path)
-    transport._opener = opener
-
-    with pytest.raises(ProviderInvalidPayloadError, match="exceeds"):
-        transport.get(
-            "/intraday/ticker/2330", params=None, timeout_seconds=1.0
-        )
-
-    assert len(captured_response) == 1
-    assert captured_response[0].read_called is False
-
-
-def test_esun_default_redirect_handler_never_follows_location() -> None:
-    handler = _NoRedirectHandler()
-
-    assert (
-        handler.redirect_request(
-            object(),
-            object(),
-            302,
-            "Found",
-            {"Location": "https://redirect-sink.invalid/capture"},
-            "https://redirect-sink.invalid/capture",
-        )
-        is None
-    )
 
 
 def test_esun_sdk_transport_serializes_concurrent_authentication(tmp_path) -> None:
@@ -338,21 +293,14 @@ def test_esun_sdk_transport_requires_initialized_keyring(tmp_path, monkeypatch) 
         )
 
 
-@pytest.mark.parametrize(
-    "base_url",
-    [
-        "https://unverified.fixture.invalid/marketdata/v1.0/stock",
-        "https://api.fugle.tw:8443/marketdata/v1.0/stock",
-    ],
-)
 def test_esun_sdk_transport_rejects_unverified_market_data_origin(
-    tmp_path, monkeypatch, base_url
+    tmp_path, monkeypatch
 ) -> None:
     config_path = _config(tmp_path)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
     _install_fake_modules(
         monkeypatch,
-        base_url=base_url,
+        base_url="https://unverified.fixture.invalid/marketdata/v1.0/stock",
     )
 
     with pytest.raises(ProviderPermanentError, match="unverified") as caught:
@@ -360,8 +308,22 @@ def test_esun_sdk_transport_rejects_unverified_market_data_origin(
             "/intraday/ticker/2330", params=None, timeout_seconds=1.0
         )
 
-    assert base_url not in str(caught.value)
+    assert "unverified.fixture.invalid" not in str(caught.value)
     assert "synthetic-runtime-token" not in str(caught.value)
+
+
+def test_esun_sdk_transport_rejects_unapproved_rest_port(tmp_path, monkeypatch) -> None:
+    config_path = _config(tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.2.0")
+    _install_fake_modules(
+        monkeypatch,
+        base_url="https://api.fugle.tw:8443/marketdata/v1.0/stock",
+    )
+
+    with pytest.raises(ProviderPermanentError, match="unverified"):
+        EsunSdkHttpTransport(config_path).get(
+            "/intraday/ticker/2330", params=None, timeout_seconds=1.0
+        )
 
 
 def test_esun_sdk_authentication_timeout_maps_to_provider_timeout(

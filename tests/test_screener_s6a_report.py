@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.reporting.screener_markdown import _cell
 from app.reporting.screener_report import (
     ScreenerReportArtifactWriter,
     ScreenerReportCollisionError,
@@ -622,6 +623,19 @@ def test_s6a_gate7_same_file_is_noop_and_different_bytes_fail_closed(
     assert markdown_path.read_bytes() == markdown_before
 
 
+def test_s6a_report_rejects_aliased_json_and_markdown_targets(tmp_path: Path) -> None:
+    database_path, run_id, unused_result = _seed_success(tmp_path)
+    generation = ScreenerReportGenerator(database_path).generate(run_id)
+    target = tmp_path / "same-report-target"
+
+    with pytest.raises(ValueError, match="distinct"):
+        ScreenerReportArtifactWriter().write(
+            generation,
+            json_path=target,
+            markdown_path=target / ".",
+        )
+
+
 def test_s6a_gate8_generation_is_database_read_only(tmp_path: Path) -> None:
     database_path, run_id, unused_result = _seed_success(tmp_path)
     before = _database_fingerprint(database_path)
@@ -630,6 +644,15 @@ def test_s6a_gate8_generation_is_database_read_only(tmp_path: Path) -> None:
     generator.generate(run_id)
     after = _database_fingerprint(database_path)
     assert before == after
+
+
+def test_s6a_markdown_cells_escape_markup_and_code_context() -> None:
+    rendered = _cell("<script>alert(`x`)</script> | [link](https://evil.invalid)")
+
+    assert "<script>" not in rendered
+    assert "[link]" not in rendered
+    assert "&#96;" in rendered
+    assert "\\|" in rendered
 
 
 def test_s6a_public_contract_requires_explicit_run_and_no_scheduler_boundary() -> None:

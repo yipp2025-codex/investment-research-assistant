@@ -36,6 +36,7 @@ from app.storage.candidate_persistence import (
 
 
 FROZEN_SCREENER_RESULT_VERSION = "screener-frozen-result-v1"
+FROZEN_SCREENER_RESULT_VERSION_V2 = "screener-frozen-result-v2"
 
 FAULT_AFTER_CANDIDATE_VERIFICATION = "after_candidate_completeness_verification"
 FAULT_AFTER_RANKING = "after_ranking_before_rank_write"
@@ -87,6 +88,16 @@ class FrozenScreenerResult:
     truncated: bool
     candidates: tuple[Stage2Candidate, ...]
     contract_version: str = FROZEN_SCREENER_RESULT_VERSION
+    execution_status: str = "success"
+    research_data_quality: str = "canonical"
+    dataset_source_policy: str = TWSE_BASELINE_SOURCE_POLICY
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    supplemental_candidate_count: int = 0
+    dataset_identity_sha256: str | None = None
+    provenance_map_sha256: str | None = None
+    dataset_version_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_sha256(self.screener_run_id, "screener_run_id")
@@ -98,9 +109,51 @@ class FrozenScreenerResult:
         if self.stage2_methodology_version != STAGE2_METHODOLOGY_VERSION:
             raise ScreenerReplayIntegrityError("Stage 2 methodology is not frozen v1")
         if self.source_policy != TWSE_BASELINE_SOURCE_POLICY:
-            raise ScreenerReplayIntegrityError("source_policy must remain twse_baseline")
-        if self.contract_version != FROZEN_SCREENER_RESULT_VERSION:
+            raise ScreenerReplayIntegrityError("legacy Stage 2 source_policy must remain twse_baseline")
+        dual = self.dataset_source_policy != TWSE_BASELINE_SOURCE_POLICY
+        expected_contract = (
+            FROZEN_SCREENER_RESULT_VERSION_V2
+            if dual or self.research_data_quality != "canonical"
+            else FROZEN_SCREENER_RESULT_VERSION
+        )
+        if self.contract_version != expected_contract:
             raise ScreenerReplayIntegrityError("unsupported frozen result contract")
+        if self.execution_status not in {"success", "provisional_success"}:
+            raise ScreenerReplayIntegrityError("unsupported frozen execution status")
+        if self.research_data_quality not in {"canonical", "provisional", "reconciled"}:
+            raise ScreenerReplayIntegrityError("unsupported research data quality")
+        if self.dataset_source_policy not in {TWSE_BASELINE_SOURCE_POLICY, "twse_dual_source_v1"}:
+            raise ScreenerReplayIntegrityError("unsupported dataset source policy")
+        if self.source_status not in {"canonical_complete", "provisional_mixed", "reconciled"}:
+            raise ScreenerReplayIntegrityError("unsupported dataset source status")
+        if self.research_data_quality == "provisional" and self.execution_status != "provisional_success":
+            raise ScreenerReplayIntegrityError("provisional research data requires provisional_success")
+        if self.research_data_quality != "provisional" and self.execution_status == "provisional_success":
+            raise ScreenerReplayIntegrityError("provisional_success requires provisional research data")
+        if self.authority_status not in {"complete", "incomplete", "reconciled"}:
+            raise ScreenerReplayIntegrityError("unsupported authority status")
+        if self.reconciliation_status not in {
+            "not_applicable", "pending", "reconciled_equal", "reconciled_discrepant"
+        }:
+            raise ScreenerReplayIntegrityError("unsupported reconciliation status")
+        if (
+            isinstance(self.supplemental_candidate_count, bool)
+            or not isinstance(self.supplemental_candidate_count, int)
+            or self.supplemental_candidate_count < 0
+        ):
+            raise ScreenerReplayIntegrityError("supplemental candidate count is invalid")
+        for value, name in (
+            (self.dataset_identity_sha256, "dataset_identity_sha256"),
+            (self.provenance_map_sha256, "provenance_map_sha256"),
+        ):
+            if value is not None:
+                _require_sha256(value, name)
+        if not isinstance(self.dataset_version_ids, tuple):
+            raise ScreenerReplayIntegrityError("dataset_version_ids must be immutable")
+        for value in self.dataset_version_ids:
+            _require_sha256(value, "dataset_version_id")
+        if dual and not self.dataset_version_ids:
+            raise ScreenerReplayIntegrityError("dual-source result requires dataset version ids")
         for field_name in (
             "universe_count",
             "screened_count",
@@ -155,7 +208,7 @@ class FrozenScreenerResult:
 
     def as_dict(self) -> dict[str, object]:
         stage2 = self.stage2_result.as_dict()
-        return {
+        result = {
             "contract_version": self.contract_version,
             "screener_run_id": self.screener_run_id,
             "universe_run_id": self.universe_run_id,
@@ -171,6 +224,22 @@ class FrozenScreenerResult:
             "truncated": self.truncated,
             "candidates": stage2["candidates"],
         }
+        if self.contract_version == FROZEN_SCREENER_RESULT_VERSION_V2:
+            result.update(
+                {
+                    "execution_status": self.execution_status,
+                    "research_data_quality": self.research_data_quality,
+                    "dataset_source_policy": self.dataset_source_policy,
+                    "source_status": self.source_status,
+                    "authority_status": self.authority_status,
+                    "reconciliation_status": self.reconciliation_status,
+                    "supplemental_candidate_count": self.supplemental_candidate_count,
+                    "dataset_identity_sha256": self.dataset_identity_sha256,
+                    "provenance_map_sha256": self.provenance_map_sha256,
+                    "dataset_version_ids": list(self.dataset_version_ids),
+                }
+            )
+        return result
 
     def canonical_json(self) -> str:
         return json.dumps(
@@ -285,18 +354,62 @@ class SQLiteScreenerReplayRepository:
 
             self._fire(fault_injector, FAULT_BEFORE_SUCCESS_TRANSITION)
             timestamp = _utc_now()
-            cursor = connection.execute(
-                "UPDATE screener_runs SET canonical_sha256 = ?, finished_at = ?, "
-                "updated_at = ?, error_code = NULL, status = 'success' "
-                "WHERE screener_run_id = ? AND status = 'running' "
-                "AND canonical_sha256 IS NULL",
-                (
-                    canonical_sha256,
-                    timestamp,
-                    timestamp,
-                    screener_run_id,
-                ),
-            )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info('screener_runs')")
+            }
+            if "ds5_execution_status" not in columns:
+                cursor = connection.execute(
+                    "UPDATE screener_runs SET canonical_sha256 = ?, finished_at = ?, "
+                    "updated_at = ?, error_code = NULL, status = 'success' "
+                    "WHERE screener_run_id = ? AND status = 'running' "
+                    "AND canonical_sha256 IS NULL",
+                    (canonical_sha256, timestamp, timestamp, screener_run_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE screener_runs SET canonical_sha256 = ?, finished_at = ?, "
+                    "updated_at = ?, error_code = NULL, status = 'success', "
+                    "ds5_execution_status = ?, ds5_source_policy = ?, "
+                    "ds5_source_status = ?, ds5_research_data_quality = ?, ds5_authority_status = ?, "
+                    "ds5_reconciliation_status = ?, ds5_supplemental_candidate_count = ?, "
+                    "ds5_canonical_authority = ?, ds5_supplemental_sources_json = ?, "
+                    "ds5_twse_observation_count = ?, ds5_missing_twse_count = ?, ds5_discrepancy_count = ?, "
+                    "ds5_dataset_identity_sha256 = ?, ds5_provenance_map_sha256 = ?, "
+                    "ds5_dataset_version_ids_json = ? "
+                    "WHERE screener_run_id = ? AND status = 'running' "
+                    "AND canonical_sha256 IS NULL",
+                    (
+                        canonical_sha256,
+                        timestamp,
+                        timestamp,
+                        result.execution_status,
+                        result.dataset_source_policy,
+                        result.source_status,
+                        result.research_data_quality,
+                        result.authority_status,
+                        result.reconciliation_status,
+                        result.supplemental_candidate_count,
+                        "twse",
+                        json.dumps(
+                            sorted(
+                                {
+                                    source
+                                    for candidate in result.candidates
+                                    for source in candidate.provenance.supplemental_sources
+                                }
+                            ),
+                            separators=(",", ":"),
+                        ),
+                        sum(item.provenance.twse_observation_count for item in result.candidates),
+                        sum(item.provenance.missing_twse_count for item in result.candidates),
+                        sum(item.provenance.discrepancy_count for item in result.candidates),
+                        result.dataset_identity_sha256,
+                        result.provenance_map_sha256,
+                        json.dumps(list(result.dataset_version_ids), separators=(",", ":")),
+                        screener_run_id,
+                    ),
+                )
             if cursor.rowcount != 1:
                 raise ScreenerFinalizationStateError(
                     "Screener run could not transition atomically to success"
@@ -484,7 +597,67 @@ class SQLiteScreenerReplayRepository:
             )
 
         cls._verify_input_manifest(run, rows)
+        cls._verify_ds5_metadata(connection, run, records)
         return tuple(records)
+
+    @staticmethod
+    def _verify_ds5_metadata(
+        connection: sqlite3.Connection,
+        run: sqlite3.Row,
+        records: tuple[_CandidateRecord, ...],
+    ) -> None:
+        if "ds5_execution_status" not in run.keys():
+            return
+        locators = tuple(
+            _candidate_store.CandidateInputLocator.from_stage2_provenance(
+                symbol=record.checkpoint.symbol,
+                provenance=record.checkpoint.provenance,
+            )
+            if record.checkpoint.provenance.dataset_version_id is not None
+            else _candidate_store.CandidateInputLocator(
+                symbol=record.checkpoint.symbol,
+                research_locator_sha256=_candidate_store._canonical_sha256(
+                    {"legacy_candidate": record.checkpoint.input_locator_sha256}
+                ),
+            )
+            for record in records
+        )
+        # A legacy v12 run retains the exact baseline defaults; its old input
+        # hash is intentionally not reinterpreted as a DS5 locator.
+        if all(item.dataset_version_id is None for item in locators):
+            expected = _candidate_store._dataset_metadata_from_locators(())
+        else:
+            expected = _candidate_store._dataset_metadata_from_locators(locators)
+            for locator in locators:
+                if locator.dataset_version_id is None:
+                    continue
+                try:
+                    _candidate_store.SQLiteScreenerCheckpointRepository._validate_dataset_version_connection(
+                        connection,
+                        locator=locator,
+                        market_date=date.fromisoformat(run["market_date"]),
+                    )
+                except _candidate_store.ScreenerCheckpointError as error:
+                    raise ScreenerReplayIntegrityError(
+                        "candidate DS5 provenance is not bound to a verified dataset version"
+                    ) from error
+        actual = {
+            "execution_status": run["ds5_execution_status"],
+            "source_policy": run["ds5_source_policy"],
+            "source_status": run["ds5_source_status"],
+            "research_data_quality": run["ds5_research_data_quality"],
+            "authority_status": run["ds5_authority_status"],
+            "reconciliation_status": run["ds5_reconciliation_status"],
+            "supplemental_candidate_count": run["ds5_supplemental_candidate_count"],
+            "dataset_identity_sha256": run["ds5_dataset_identity_sha256"],
+            "provenance_map_sha256": run["ds5_provenance_map_sha256"],
+            "dataset_version_ids_json": run["ds5_dataset_version_ids_json"],
+        }
+        for field_name in actual:
+            if actual[field_name] != expected[field_name]:
+                raise ScreenerReplayIntegrityError(
+                    f"persisted DS5 run metadata changed: {field_name}"
+                )
 
     @staticmethod
     def _verify_child_ordinals(
@@ -642,6 +815,20 @@ class SQLiteScreenerReplayRepository:
     def _build_result(
         run: sqlite3.Row, candidates: tuple[Stage2Candidate, ...]
     ) -> FrozenScreenerResult:
+        keys = set(run.keys())
+        dataset_version_ids = (
+            tuple(json.loads(run["ds5_dataset_version_ids_json"]))
+            if "ds5_dataset_version_ids_json" in keys
+            else ()
+        )
+        dataset_source_policy = (
+            run["ds5_source_policy"] if "ds5_source_policy" in keys else TWSE_BASELINE_SOURCE_POLICY
+        )
+        quality = (
+            run["ds5_research_data_quality"]
+            if "ds5_research_data_quality" in keys
+            else "canonical"
+        )
         return FrozenScreenerResult(
             screener_run_id=run["screener_run_id"],
             universe_run_id=run["universe_run_id"],
@@ -656,6 +843,45 @@ class SQLiteScreenerReplayRepository:
             candidate_limit=run["candidate_limit"],
             truncated=bool(run["truncated"]),
             candidates=candidates,
+            contract_version=(
+                "screener-frozen-result-v2"
+                if dataset_source_policy != TWSE_BASELINE_SOURCE_POLICY or quality != "canonical"
+                else "screener-frozen-result-v1"
+            ),
+            execution_status=(
+                run["ds5_execution_status"] if "ds5_execution_status" in keys else "success"
+            ),
+            research_data_quality=quality,
+            dataset_source_policy=dataset_source_policy,
+            source_status=(
+                run["ds5_source_status"]
+                if "ds5_source_status" in keys
+                else "canonical_complete"
+            ),
+            authority_status=(
+                run["ds5_authority_status"] if "ds5_authority_status" in keys else "complete"
+            ),
+            reconciliation_status=(
+                run["ds5_reconciliation_status"]
+                if "ds5_reconciliation_status" in keys
+                else "not_applicable"
+            ),
+            supplemental_candidate_count=(
+                run["ds5_supplemental_candidate_count"]
+                if "ds5_supplemental_candidate_count" in keys
+                else 0
+            ),
+            dataset_identity_sha256=(
+                run["ds5_dataset_identity_sha256"]
+                if "ds5_dataset_identity_sha256" in keys
+                else None
+            ),
+            provenance_map_sha256=(
+                run["ds5_provenance_map_sha256"]
+                if "ds5_provenance_map_sha256" in keys
+                else None
+            ),
+            dataset_version_ids=dataset_version_ids,
         )
 
     @staticmethod

@@ -416,6 +416,24 @@ def test_s5_full_run_and_strict_replay(tmp_path: Path) -> None:
     assert replay_calls == Counter()
 
 
+def test_s5_replay_runs_optional_candidate_validation_hook(
+    tmp_path: Path,
+) -> None:
+    orchestrator, _calls = _orchestrator(tmp_path)
+    validated: list[tuple[str, date]] = []
+    orchestrator.candidate_validation_hook = (
+        lambda symbol, market_date: validated.append((symbol, market_date))
+    )
+
+    first = orchestrator.run(MARKET_DATE)
+    assert first.status == "success"
+    assert validated == []
+
+    second = orchestrator.run(MARKET_DATE)
+    assert second.replayed is True
+    assert validated == [(symbol, MARKET_DATE) for symbol in SYMBOLS]
+
+
 def test_s5_partial_failure_retries_only_failed_candidate(tmp_path: Path) -> None:
     orchestrator, calls = _orchestrator(tmp_path, failure_budget={"1003": 1})
 
@@ -553,4 +571,7 @@ def test_s5_schema_and_import_boundary_has_no_scheduler_or_new_migration() -> No
         for path in (source_path.parents[1] / "storage" / "migrations").glob("*.sql")
     }
     assert "0011_market_screener_persistence.sql" in migration_names
-    assert not any(name.startswith("0012_") for name in migration_names)
+    assert "0012_dual_source_dataset_versions.sql" in migration_names
+    source_text = source_path.read_text(encoding="utf-8")
+    assert "DatasetVersionRepository" not in source_text
+    assert "DatasetVersionMigrationRunner" not in source_text

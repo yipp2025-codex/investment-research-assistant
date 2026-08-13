@@ -175,6 +175,13 @@ class ReplayKeyResolver(Protocol):
         ...
 
 
+class CandidateValidationHook(Protocol):
+    """Complete an external source-validation checkpoint for one candidate."""
+
+    def __call__(self, symbol: str, market_date: date, /) -> None:
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class DailyScreenerResult:
     """Operational S5 result wrapping the frozen S4 result when successful.
@@ -313,6 +320,7 @@ class DailyScreenerOrchestrator:
         stage1_runner: Stage1Runner,
         stage2_runner: Stage2Runner,
         replay_key_resolver: ReplayKeyResolver | None = None,
+        candidate_validation_hook: CandidateValidationHook | None = None,
         universe_repository: SQLiteMarketUniverseRepository | None = None,
         checkpoint_repository: SQLiteScreenerCheckpointRepository | None = None,
         replay_repository: SQLiteScreenerReplayRepository | None = None,
@@ -325,11 +333,17 @@ class DailyScreenerOrchestrator:
             raise TypeError("stage2_runner must be callable")
         if replay_key_resolver is not None and not callable(replay_key_resolver):
             raise TypeError("replay_key_resolver must be callable")
+        if (
+            candidate_validation_hook is not None
+            and not callable(candidate_validation_hook)
+        ):
+            raise TypeError("candidate_validation_hook must be callable")
         self.database_path = Path(database_path)
         self.universe_provider = universe_provider
         self.stage1_runner = stage1_runner
         self.stage2_runner = stage2_runner
         self.replay_key_resolver = replay_key_resolver
+        self.candidate_validation_hook = candidate_validation_hook
         self.universe_repository = universe_repository or SQLiteMarketUniverseRepository(
             self.database_path
         )
@@ -374,6 +388,7 @@ class DailyScreenerOrchestrator:
                 requested_run_id,
             )
             if replayed is not None:
+                self._run_candidate_validation_hooks(frozen_date, replayed)
                 return replayed
             if explicit_run_id and self._run_status(requested_run_id) is None:
                 raise DailyScreenerStateError(
@@ -404,6 +419,7 @@ class DailyScreenerOrchestrator:
         # replay probe.  Re-check before any Stage 2 hook is called.
         replayed = self._try_replay(frozen_date, run_id)
         if replayed is not None:
+            self._run_candidate_validation_hooks(frozen_date, replayed)
             return _replace_replay_flags(
                 replayed,
                 universe_created=universe_result.created,
@@ -428,6 +444,7 @@ class DailyScreenerOrchestrator:
                     raise DailyScreenerStateError(
                         f"successful candidate {symbol} has no checkpoint"
                     )
+                self._run_candidate_validation_hook(symbol, frozen_date)
                 candidates[symbol] = _candidate_from_checkpoint(previous.checkpoint)
                 candidate_replayed_count += 1
                 continue
@@ -666,6 +683,18 @@ class DailyScreenerOrchestrator:
         finally:
             connection.close()
 
+    def _run_candidate_validation_hooks(
+        self,
+        market_date: date,
+        result: DailyScreenerResult,
+    ) -> None:
+        for candidate in result.candidates:
+            self._run_candidate_validation_hook(candidate.symbol, market_date)
+
+    def _run_candidate_validation_hook(self, symbol: str, market_date: date) -> None:
+        if self.candidate_validation_hook is not None:
+            self.candidate_validation_hook(symbol, market_date)
+
     def _read_connection(self) -> sqlite3.Connection:
         uri = self.database_path.resolve().as_uri() + "?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -743,6 +772,7 @@ __all__ = [
     "DailyScreenerPreparation",
     "DailyScreenerResult",
     "DailyScreenerStateError",
+    "CandidateValidationHook",
     "Stage1Execution",
     "Stage1Runner",
     "Stage2CandidateExecution",

@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, urlsplit
 from app.research_dataset import (
     ESUN_VALIDATION_SOURCES,
     MOCK_SYNTHETIC_SOURCE,
+    TWSE_BASELINE_SOURCE_POLICY,
     TWSE_BASELINE_SOURCES,
 )
 from app.screener.stage1 import (
@@ -44,6 +45,13 @@ from app.screener.stage2 import (
     Stage2QualityStatus,
     Stage2Reason,
 )
+from app.storage.dataset_versions import (
+    DatasetMigrationStateError,
+    DatasetPersistenceIntegrityError,
+    DatasetVersionMigrationRunner,
+    DatasetVersionNotFoundError,
+    DatasetVersionRepository,
+)
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -56,7 +64,14 @@ _SENSITIVE_QUERY_KEYS = frozenset(
     {
         "api_key",
         "apikey",
+        "access_token",
+        "api_token",
+        "api-token",
+        "x-api-key",
+        "x_api_key",
         "authorization",
+        "auth",
+        "bearer",
         "credential",
         "credentials",
         "key",
@@ -64,6 +79,10 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "secret",
         "signature",
         "token",
+        "client_secret",
+        "private_key",
+        "x-amz-credential",
+        "x-amz-signature",
     }
 )
 
@@ -87,7 +106,19 @@ class CandidateSourcePolicyError(ScreenerCheckpointError):
 @dataclass(frozen=True, slots=True)
 class CandidateInputLocator:
     symbol: str
-    research_locator_sha256: str
+    research_locator_sha256: str | None = None
+    dataset_version_id: str | None = None
+    source_policy: str = TWSE_BASELINE_SOURCE_POLICY
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    research_data_quality: str = "canonical"
+    supplemental_count: int = 0
+    twse_observation_count: int = 0
+    missing_twse_count: int = 0
+    discrepancy_count: int = 0
+    supplemental_sources: tuple[str, ...] = ()
+    provenance_map_sha256: str | None = None
 
     def __post_init__(self) -> None:
         symbol = self.symbol.strip().upper() if isinstance(self.symbol, str) else ""
@@ -96,7 +127,92 @@ class CandidateInputLocator:
         if len(symbol) < 2:
             raise ValueError("locator symbol must be 2-12 uppercase letters or digits")
         object.__setattr__(self, "symbol", symbol)
-        _require_sha256(self.research_locator_sha256, "research_locator_sha256")
+        if self.source_policy not in {TWSE_BASELINE_SOURCE_POLICY, "twse_dual_source_v1"}:
+            raise ValueError("source_policy is unsupported")
+        if self.dataset_version_id is None:
+            _require_sha256(self.research_locator_sha256, "research_locator_sha256")
+            if self.source_policy != TWSE_BASELINE_SOURCE_POLICY:
+                raise ValueError("dual-source locator requires dataset_version_id")
+        else:
+            _require_sha256(self.dataset_version_id, "dataset_version_id")
+            if self.source_policy != "twse_dual_source_v1":
+                raise ValueError("dataset_version_id requires the dual-source policy")
+            _require_sha256(self.provenance_map_sha256, "provenance_map_sha256")
+            if self.source_status not in {"canonical_complete", "provisional_mixed", "reconciled"}:
+                raise ValueError("source_status is unsupported")
+            if self.authority_status not in {"complete", "incomplete", "reconciled"}:
+                raise ValueError("authority_status is unsupported")
+            if self.reconciliation_status not in {
+                "not_applicable", "pending", "reconciled_equal", "reconciled_discrepant"
+            }:
+                raise ValueError("reconciliation_status is unsupported")
+            if self.research_data_quality not in {"canonical", "provisional", "reconciled"}:
+                raise ValueError("research_data_quality is unsupported")
+            if (
+                isinstance(self.supplemental_count, bool)
+                or not isinstance(self.supplemental_count, int)
+                or self.supplemental_count < 0
+            ):
+                raise ValueError("supplemental_count must be non-negative")
+            for field_name in (
+                "twse_observation_count", "missing_twse_count", "discrepancy_count"
+            ):
+                value = getattr(self, field_name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"{field_name} must be non-negative")
+            object.__setattr__(
+                self,
+                "supplemental_sources",
+                tuple(sorted(set(self.supplemental_sources))),
+            )
+            if any(item not in {"esun", "esun-historical"} for item in self.supplemental_sources):
+                raise ValueError("supplemental_sources must contain only E.SUN")
+            computed = _canonical_sha256(self.identity_payload())
+            if self.research_locator_sha256 is None:
+                object.__setattr__(self, "research_locator_sha256", computed)
+            else:
+                _require_sha256(self.research_locator_sha256, "research_locator_sha256")
+                if self.research_locator_sha256 != computed:
+                    raise ScreenerCheckpointConflictError(
+                        "research locator hash does not match the explicit dataset identity"
+                    )
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "identity_version": "screener-dataset-input-v1",
+            "dataset_version_id": self.dataset_version_id,
+            "source_policy": self.source_policy,
+            "source_status": self.source_status,
+            "authority_status": self.authority_status,
+            "reconciliation_status": self.reconciliation_status,
+            "research_data_quality": self.research_data_quality,
+            "supplemental_count": self.supplemental_count,
+            "twse_observation_count": self.twse_observation_count,
+            "missing_twse_count": self.missing_twse_count,
+            "discrepancy_count": self.discrepancy_count,
+            "supplemental_sources": list(self.supplemental_sources),
+            "provenance_map_sha256": self.provenance_map_sha256,
+        }
+
+    @classmethod
+    def from_stage2_provenance(cls, *, symbol: str, provenance: Stage2Provenance) -> "CandidateInputLocator":
+        if not isinstance(provenance, Stage2Provenance) or provenance.dataset_version_id is None:
+            raise ValueError("dual-source Stage2 provenance is required")
+        return cls(
+            symbol=symbol,
+            dataset_version_id=provenance.dataset_version_id,
+            source_policy=provenance.source_policy,
+            source_status=provenance.source_status,
+            authority_status=provenance.authority_status,
+            reconciliation_status=provenance.reconciliation_status,
+            research_data_quality=provenance.research_data_quality,
+            supplemental_count=provenance.esun_supplemental_count,
+            twse_observation_count=provenance.twse_observation_count,
+            missing_twse_count=provenance.missing_twse_count,
+            discrepancy_count=provenance.discrepancy_count,
+            supplemental_sources=provenance.supplemental_sources,
+            provenance_map_sha256=provenance.provenance_map_sha256,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +347,10 @@ class SQLiteScreenerCheckpointRepository:
         }
         screener_run_id = _canonical_sha256(identity)
         timestamp = _utc_now()
+        self._validate_dataset_version_locators(
+            candidate_inputs,
+            market_date=stage1_result.market_date,
+        )
 
         with self._write_transaction() as connection:
             self._require_v11(connection)
@@ -261,6 +381,7 @@ class SQLiteScreenerCheckpointRepository:
                     stage1_result=stage1_result,
                     stage2_methodology_version=stage2_methodology_version,
                     input_manifest_sha256=input_manifest_sha256,
+                    candidate_inputs=candidate_inputs,
                     timestamp=timestamp,
                 )
                 self._insert_candidate_shells(
@@ -304,6 +425,15 @@ class SQLiteScreenerCheckpointRepository:
             raise CandidateSourcePolicyError(
                 "successful candidate requires explicit canonical source provenance"
             )
+        if candidate.provenance.dataset_version_id is not None:
+            expected_locator = CandidateInputLocator.from_stage2_provenance(
+                symbol=candidate.symbol,
+                provenance=candidate.provenance,
+            )
+            if expected_locator.research_locator_sha256 != research_locator_sha256:
+                raise ScreenerCheckpointConflictError(
+                    "candidate provenance does not match the explicit input locator"
+                )
         self._validate_source_policy(candidate.provenance)
         input_locator_sha256 = self._candidate_input_sha256(
             candidate,
@@ -326,6 +456,15 @@ class SQLiteScreenerCheckpointRepository:
             if run["status"] == "success":
                 raise ScreenerCheckpointStateError(
                     "successful Screener run cannot accept candidate checkpoints"
+                )
+            if candidate.provenance.dataset_version_id is not None:
+                self._validate_dataset_version_connection(
+                    connection,
+                    locator=CandidateInputLocator.from_stage2_provenance(
+                        symbol=candidate.symbol,
+                        provenance=candidate.provenance,
+                    ),
+                    market_date=date.fromisoformat(run["market_date"]),
                 )
             row = self._get_candidate_row(connection, candidate_id)
             self._validate_candidate_identity(
@@ -599,17 +738,12 @@ class SQLiteScreenerCheckpointRepository:
         stage1_result: Stage1ScanResult,
         stage2_methodology_version: str,
         input_manifest_sha256: str,
+        candidate_inputs: tuple[
+            tuple[Stage1Candidate, CandidateInputLocator, str], ...
+        ],
         timestamp: str,
     ) -> None:
-        connection.execute(
-            "INSERT INTO screener_runs ("
-            "screener_run_id, market_date, universe_run_id, "
-            "stage1_methodology_version, stage2_methodology_version, source_policy, "
-            "candidate_limit, input_manifest_sha256, stage1_canonical_sha256, "
-            "universe_count, screened_count, triggered_count, candidate_count, "
-            "truncated, status, attempt_count, created_at, started_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, ?, ?)",
-            (
+        values = (
                 screener_run_id,
                 stage1_result.market_date.isoformat(),
                 universe_run_id,
@@ -627,7 +761,61 @@ class SQLiteScreenerCheckpointRepository:
                 timestamp,
                 timestamp,
                 timestamp,
-            ),
+        )
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('screener_runs')")
+        }
+        if "ds5_execution_status" not in columns:
+            connection.execute(
+                "INSERT INTO screener_runs ("
+                "screener_run_id, market_date, universe_run_id, "
+                "stage1_methodology_version, stage2_methodology_version, source_policy, "
+                "candidate_limit, input_manifest_sha256, stage1_canonical_sha256, "
+                "universe_count, screened_count, triggered_count, candidate_count, "
+                "truncated, status, attempt_count, created_at, started_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 1, ?, ?, ?)",
+                values,
+            )
+            return
+        metadata = _dataset_metadata_from_locators(
+            tuple(locator for unused_candidate, locator, unused_hash in candidate_inputs)
+        )
+        insert_columns = (
+            "screener_run_id, market_date, universe_run_id, "
+            "stage1_methodology_version, stage2_methodology_version, source_policy, "
+            "candidate_limit, input_manifest_sha256, stage1_canonical_sha256, "
+            "universe_count, screened_count, triggered_count, candidate_count, "
+            "truncated, status, attempt_count, created_at, started_at, updated_at, "
+            "ds5_execution_status, ds5_source_policy, ds5_research_data_quality, "
+            "ds5_source_status, ds5_authority_status, ds5_reconciliation_status, "
+            "ds5_supplemental_candidate_count, ds5_canonical_authority, "
+            "ds5_supplemental_sources_json, ds5_twse_observation_count, "
+            "ds5_missing_twse_count, ds5_discrepancy_count, ds5_dataset_identity_sha256, "
+            "ds5_provenance_map_sha256, ds5_dataset_version_ids_json"
+        )
+        insert_values = values[:14] + ("running", 1) + values[14:] + (
+                metadata["execution_status"],
+                metadata["source_policy"],
+                metadata["research_data_quality"],
+                metadata["source_status"],
+                metadata["authority_status"],
+                metadata["reconciliation_status"],
+                metadata["supplemental_candidate_count"],
+                "twse",
+                metadata["supplemental_sources"],
+                metadata["twse_observation_count"],
+                metadata["missing_twse_count"],
+                metadata["discrepancy_count"],
+                metadata["dataset_identity_sha256"],
+                metadata["provenance_map_sha256"],
+                metadata["dataset_version_ids_json"],
+        )
+        connection.execute(
+            f"INSERT INTO screener_runs ({insert_columns}) VALUES ("
+            + ", ".join("?" for unused in insert_values)
+            + ")",
+            insert_values,
         )
 
     @classmethod
@@ -642,6 +830,44 @@ class SQLiteScreenerCheckpointRepository:
         ],
         timestamp: str,
     ) -> None:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('screener_candidates')")
+        }
+        if "ds5_dataset_version_id" in columns:
+            connection.executemany(
+                "INSERT INTO screener_candidates ("
+                "candidate_id, screener_run_id, universe_run_id, symbol, status, rank, "
+                "stage1_rank, stage1_trigger_count, stage1_reason_count, input_locator_sha256, "
+                "ds5_dataset_version_id, ds5_source_policy, ds5_source_status, ds5_authority_status, "
+                "ds5_reconciliation_status, ds5_research_data_quality, ds5_esun_supplemental_count, "
+                "ds5_provenance_map_sha256, attempt_count, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (
+                    (
+                        cls._candidate_id(screener_run_id, candidate.symbol),
+                        screener_run_id,
+                        universe_run_id,
+                        candidate.symbol,
+                        candidate.rank,
+                        sum(reason.role == "primary" for reason in candidate.reasons),
+                        len(candidate.reasons),
+                        input_sha256,
+                        locator.dataset_version_id,
+                        locator.source_policy,
+                        locator.source_status,
+                        locator.authority_status,
+                        locator.reconciliation_status,
+                        locator.research_data_quality,
+                        locator.supplemental_count,
+                        locator.provenance_map_sha256,
+                        timestamp,
+                        timestamp,
+                    )
+                    for candidate, locator, input_sha256 in candidate_inputs
+                ),
+            )
+            return
         connection.executemany(
             "INSERT INTO screener_candidates ("
             "candidate_id, screener_run_id, universe_run_id, symbol, status, rank, "
@@ -967,16 +1193,20 @@ class SQLiteScreenerCheckpointRepository:
         failure_type = (
             None if candidate.failure is None else candidate.failure.error_type
         )
-        cursor = connection.execute(
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('screener_candidates')")
+        }
+        base_sql = (
             "UPDATE screener_candidates SET status = ?, rank = NULL, "
             "candidate_kind = ?, stage2_reason_count = ?, metric_count = ?, "
             "data_quality_status = ?, validation_status = ?, analysis_status = ?, "
             "pipeline_run_id = ?, historical_run_id = ?, validation_run_id = ?, "
             "canonical_sources_json = ?, validation_sources_json = ?, "
             "discrepancies_json = ?, snapshot_sha256 = ?, payload_sha256 = ?, "
-            "failure_code = ?, failure_type = ?, finished_at = ?, updated_at = ? "
-            "WHERE candidate_id = ? AND status = 'running'",
-            (
+            "failure_code = ?, failure_type = ?, finished_at = ?, updated_at = ?"
+        )
+        values = [
                 checkpoint_status,
                 candidate.candidate_kind.value,
                 len(candidate.stage2_reasons),
@@ -996,9 +1226,38 @@ class SQLiteScreenerCheckpointRepository:
                 failure_type,
                 timestamp,
                 timestamp,
-                candidate_id,
-            ),
-        )
+        ]
+        if "ds5_dataset_version_id" in columns:
+            base_sql += (
+                ", ds5_dataset_version_id = ?, ds5_source_policy = ?, "
+                "ds5_source_status = ?, ds5_authority_status = ?, "
+                "ds5_reconciliation_status = ?, ds5_research_data_quality = ?, "
+                "ds5_canonical_authority = ?, ds5_supplemental_sources_json = ?, "
+                "ds5_twse_observation_count = ?, ds5_esun_supplemental_count = ?, "
+                "ds5_missing_twse_count = ?, ds5_discrepancy_count = ?, "
+                "ds5_provenance_map_sha256 = ?, ds5_parent_dataset_version_id = ?"
+            )
+            values.extend(
+                [
+                    candidate.provenance.dataset_version_id,
+                    candidate.provenance.source_policy,
+                    candidate.provenance.source_status,
+                    candidate.provenance.authority_status,
+                    candidate.provenance.reconciliation_status,
+                    candidate.provenance.research_data_quality,
+                    candidate.provenance.canonical_authority,
+                    _canonical_json(list(candidate.provenance.supplemental_sources)),
+                    candidate.provenance.twse_observation_count,
+                    candidate.provenance.esun_supplemental_count,
+                    candidate.provenance.missing_twse_count,
+                    candidate.provenance.discrepancy_count,
+                    candidate.provenance.provenance_map_sha256,
+                    candidate.provenance.parent_dataset_version_id,
+                ]
+            )
+        base_sql += " WHERE candidate_id = ? AND status = 'running'"
+        values.append(candidate_id)
+        cursor = connection.execute(base_sql, values)
         if cursor.rowcount != 1:
             raise ScreenerCheckpointStateError(
                 "candidate bundle could not transition atomically to terminal checkpoint"
@@ -1037,11 +1296,106 @@ class SQLiteScreenerCheckpointRepository:
             status = "failed"
             finished_at = timestamp
             error_code = "all_candidates_failed"
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info('screener_runs')")
+        }
+        if "ds5_execution_status" not in columns:
+            connection.execute(
+                "UPDATE screener_runs SET status = ?, canonical_sha256 = NULL, "
+                "finished_at = ?, error_code = ?, updated_at = ? "
+                "WHERE screener_run_id = ? AND status <> 'success'",
+                (status, finished_at, error_code, timestamp, screener_run_id),
+            )
+            return
+        metadata = {
+            "execution_status": "success",
+            "source_policy": TWSE_BASELINE_SOURCE_POLICY,
+            "source_status": "canonical_complete",
+            "research_data_quality": "canonical",
+            "authority_status": "complete",
+            "reconciliation_status": "not_applicable",
+            "supplemental_count": 0,
+            "supplemental_candidate_count": 0,
+            "supplemental_sources": "[]",
+            "twse_observation_count": 0,
+            "missing_twse_count": 0,
+            "discrepancy_count": 0,
+            "dataset_identity_sha256": None,
+            "provenance_map_sha256": None,
+            "dataset_version_ids_json": "[]",
+        }
+        if failed == 0 and open_count == 0:
+            candidate_rows = connection.execute(
+                "SELECT symbol, input_locator_sha256, ds5_dataset_version_id, ds5_source_policy, "
+                "ds5_source_status, ds5_authority_status, ds5_reconciliation_status, "
+                "ds5_research_data_quality, ds5_esun_supplemental_count, "
+                "ds5_supplemental_sources_json, ds5_twse_observation_count, "
+                "ds5_missing_twse_count, ds5_discrepancy_count, ds5_provenance_map_sha256 FROM screener_candidates "
+                "WHERE screener_run_id = ? ORDER BY symbol",
+                (screener_run_id,),
+            ).fetchall()
+            locators = tuple(
+                CandidateInputLocator(
+                    symbol=row["symbol"],
+                    # Legacy TWSE rows predate DS5 dataset-version identity.
+                    # Their immutable S4 input locator is only a valid
+                    # placeholder for the legacy metadata aggregation path;
+                    # it is never treated as a DS5 dataset identity.
+                    research_locator_sha256=(
+                        row["input_locator_sha256"]
+                        if row["ds5_dataset_version_id"] is None
+                        else None
+                    ),
+                    dataset_version_id=row["ds5_dataset_version_id"],
+                    source_policy=row["ds5_source_policy"],
+                    source_status=row["ds5_source_status"],
+                    authority_status=row["ds5_authority_status"],
+                    reconciliation_status=row["ds5_reconciliation_status"],
+                    research_data_quality=row["ds5_research_data_quality"],
+                    supplemental_count=row["ds5_esun_supplemental_count"],
+                    supplemental_sources=tuple(json.loads(row["ds5_supplemental_sources_json"])),
+                    twse_observation_count=row["ds5_twse_observation_count"],
+                    missing_twse_count=row["ds5_missing_twse_count"],
+                    discrepancy_count=row["ds5_discrepancy_count"],
+                    provenance_map_sha256=row["ds5_provenance_map_sha256"],
+                )
+                for row in candidate_rows
+            )
+            metadata = _dataset_metadata_from_locators(locators)
         connection.execute(
             "UPDATE screener_runs SET status = ?, canonical_sha256 = NULL, "
-            "finished_at = ?, error_code = ?, updated_at = ? "
+            "finished_at = ?, error_code = ?, updated_at = ?, "
+            "ds5_execution_status = ?, ds5_source_policy = ?, "
+            "ds5_source_status = ?, ds5_research_data_quality = ?, ds5_authority_status = ?, "
+            "ds5_reconciliation_status = ?, ds5_supplemental_candidate_count = ?, "
+            "ds5_canonical_authority = ?, ds5_supplemental_sources_json = ?, "
+            "ds5_twse_observation_count = ?, ds5_missing_twse_count = ?, ds5_discrepancy_count = ?, "
+            "ds5_dataset_identity_sha256 = ?, ds5_provenance_map_sha256 = ?, "
+            "ds5_dataset_version_ids_json = ? "
             "WHERE screener_run_id = ? AND status <> 'success'",
-            (status, finished_at, error_code, timestamp, screener_run_id),
+            (
+                status,
+                finished_at,
+                error_code,
+                timestamp,
+                metadata["execution_status"],
+                metadata["source_policy"],
+                metadata["source_status"],
+                metadata["research_data_quality"],
+                metadata["authority_status"],
+                metadata["reconciliation_status"],
+                metadata["supplemental_candidate_count"],
+                "twse",
+                metadata["supplemental_sources"],
+                metadata["twse_observation_count"],
+                metadata["missing_twse_count"],
+                metadata["discrepancy_count"],
+                metadata["dataset_identity_sha256"],
+                metadata["provenance_map_sha256"],
+                metadata["dataset_version_ids_json"],
+                screener_run_id,
+            ),
         )
 
     @classmethod
@@ -1139,6 +1493,13 @@ class SQLiteScreenerCheckpointRepository:
             validation_status=row["validation_status"],
             discrepancies=discrepancies,
         )
+        row_keys = set(row.keys())
+        ds5_present = "ds5_source_policy" in row_keys
+        supplemental_sources = (
+            tuple(json.loads(row["ds5_supplemental_sources_json"]))
+            if ds5_present and "ds5_supplemental_sources_json" in row_keys
+            else ()
+        )
         provenance = Stage2Provenance(
             pipeline_run_id=row["pipeline_run_id"],
             historical_run_id=row["historical_run_id"],
@@ -1154,6 +1515,41 @@ class SQLiteScreenerCheckpointRepository:
                 validation_sources=tuple(
                     json.loads(row["validation_sources_json"])
                 ),
+                supplemental_sources=supplemental_sources,
+            ),
+            source_policy=(
+                row["ds5_source_policy"] if ds5_present else TWSE_BASELINE_SOURCE_POLICY
+            ),
+            dataset_version_id=(row["ds5_dataset_version_id"] if ds5_present else None),
+            source_status=(row["ds5_source_status"] if ds5_present else "canonical_complete"),
+            authority_status=(row["ds5_authority_status"] if ds5_present else "complete"),
+            reconciliation_status=(
+                row["ds5_reconciliation_status"] if ds5_present else "not_applicable"
+            ),
+            research_data_quality=(
+                row["ds5_research_data_quality"] if ds5_present else "canonical"
+            ),
+            canonical_authority=(
+                row["ds5_canonical_authority"] if ds5_present else "twse"
+            ),
+            supplemental_sources=supplemental_sources,
+            twse_observation_count=(
+                row["ds5_twse_observation_count"] if ds5_present else 0
+            ),
+            esun_supplemental_count=(
+                row["ds5_esun_supplemental_count"] if ds5_present else 0
+            ),
+            missing_twse_count=(
+                row["ds5_missing_twse_count"] if ds5_present else 0
+            ),
+            discrepancy_count=(
+                row["ds5_discrepancy_count"] if ds5_present else 0
+            ),
+            provenance_map_sha256=(
+                row["ds5_provenance_map_sha256"] if ds5_present else None
+            ),
+            parent_dataset_version_id=(
+                row["ds5_parent_dataset_version_id"] if ds5_present else None
             ),
         )
         failure = (
@@ -1215,6 +1611,7 @@ class SQLiteScreenerCheckpointRepository:
         *,
         canonical_sources: tuple[str, ...],
         validation_sources: tuple[str, ...],
+        supplemental_sources: tuple[str, ...] = (),
     ) -> tuple[Stage2ArtifactRef, ...]:
         rows = connection.execute(
             "SELECT * FROM screener_source_artifacts "
@@ -1228,6 +1625,7 @@ class SQLiteScreenerCheckpointRepository:
             canonical_sources=canonical_sources,
             validation_sources=validation_sources,
             artifact_refs=(),
+            supplemental_sources=supplemental_sources,
         )
         artifacts = []
         for ordinal, row in enumerate(rows, 1):
@@ -1328,8 +1726,43 @@ class SQLiteScreenerCheckpointRepository:
 
     @classmethod
     def _validate_source_policy(cls, provenance: Stage2Provenance) -> None:
+        if provenance.source_policy == "twse_dual_source_v1":
+            if provenance.dataset_version_id is None or provenance.provenance_map_sha256 is None:
+                raise CandidateSourcePolicyError(
+                    "dual-source candidate requires dataset identity and provenance hash"
+                )
+            expected_quality = {
+                "canonical_complete": "canonical",
+                "provisional_mixed": "provisional",
+                "reconciled": "reconciled",
+            }[provenance.source_status]
+            if provenance.research_data_quality != expected_quality:
+                raise CandidateSourcePolicyError(
+                    "candidate source status and research data quality disagree"
+                )
+            if provenance.source_status == "provisional_mixed":
+                if provenance.authority_status != "incomplete" or provenance.reconciliation_status != "pending":
+                    raise CandidateSourcePolicyError(
+                        "provisional candidate must remain incomplete and pending"
+                    )
+                if provenance.esun_supplemental_count <= 0:
+                    raise CandidateSourcePolicyError(
+                        "provisional candidate requires E.SUN supplemental coverage"
+                    )
+            if provenance.source_status == "reconciled":
+                if provenance.authority_status != "reconciled" or provenance.reconciliation_status not in {
+                    "reconciled_equal", "reconciled_discrepant"
+                }:
+                    raise CandidateSourcePolicyError(
+                        "reconciled candidate status is incomplete"
+                    )
+                if provenance.esun_supplemental_count != 0:
+                    raise CandidateSourcePolicyError(
+                        "reconciled candidate cannot select E.SUN supplemental rows"
+                    )
         canonical = {item.casefold() for item in provenance.canonical_sources}
         validation = {item.casefold() for item in provenance.validation_sources}
+        supplemental = {item.casefold() for item in provenance.supplemental_sources}
         for artifact in provenance.artifact_refs:
             cls._validate_artifact(artifact)
         artifact_sources = {
@@ -1362,8 +1795,106 @@ class SQLiteScreenerCheckpointRepository:
             raise CandidateSourcePolicyError(
                 "candidate validation source is outside the frozen source families"
             )
+        if supplemental - ESUN_VALIDATION_SOURCES:
+            raise CandidateSourcePolicyError(
+                "candidate supplemental source is outside the E.SUN family"
+            )
+        if provenance.esun_supplemental_count and not supplemental:
+            raise CandidateSourcePolicyError(
+                "supplemental observation count requires explicit E.SUN provenance"
+            )
         for artifact in provenance.artifact_refs:
             cls._artifact_role(artifact, provenance)
+
+    def _validate_dataset_version_locators(
+        self,
+        candidate_inputs: tuple[
+            tuple[Stage1Candidate, CandidateInputLocator, str], ...
+        ],
+        *,
+        market_date: date,
+    ) -> None:
+        for candidate, locator, unused_hash in candidate_inputs:
+            if locator.dataset_version_id is None:
+                continue
+            try:
+                version = DatasetVersionRepository(self.database_path).replay(
+                    locator.dataset_version_id
+                )
+            except (
+                DatasetMigrationStateError,
+                DatasetVersionNotFoundError,
+                DatasetPersistenceIntegrityError,
+            ) as error:
+                raise ScreenerCheckpointConflictError(
+                    f"dataset version for {candidate.symbol} is not a verified persisted v12 version"
+                ) from error
+            self._assert_dataset_version_locator(
+                version,
+                locator=locator,
+                market_date=market_date,
+            )
+
+    @staticmethod
+    def _validate_dataset_version_connection(
+        connection: sqlite3.Connection,
+        *,
+        locator: CandidateInputLocator,
+        market_date: date,
+    ) -> None:
+        try:
+            DatasetVersionMigrationRunner._require_v12(connection)
+            version = DatasetVersionRepository._reconstruct(
+                connection,
+                locator.dataset_version_id,
+            )
+        except (
+            DatasetMigrationStateError,
+            DatasetVersionNotFoundError,
+            DatasetPersistenceIntegrityError,
+        ) as error:
+            raise ScreenerCheckpointConflictError(
+                "candidate dataset_version_id is not a verified persisted v12 version"
+            ) from error
+        SQLiteScreenerCheckpointRepository._assert_dataset_version_locator(
+            version,
+            locator=locator,
+            market_date=market_date,
+        )
+
+    @staticmethod
+    def _assert_dataset_version_locator(
+        version: object,
+        *,
+        locator: CandidateInputLocator,
+        market_date: date,
+    ) -> None:
+        identity = version.identity
+        coverage = identity.coverage
+        summary = version.provenance_summary
+        quality = {
+            "canonical_complete": "canonical",
+            "provisional_mixed": "provisional",
+            "reconciled": "reconciled",
+        }[identity.source_status.value]
+        expected = (
+            identity.symbol == locator.symbol
+            and identity.source_policy == locator.source_policy
+            and identity.source_status.value == locator.source_status
+            and identity.authority_status.value == locator.authority_status
+            and identity.reconciliation_status.value == locator.reconciliation_status
+            and quality == locator.research_data_quality
+            and coverage.twse_observation_count == locator.twse_observation_count
+            and coverage.esun_supplemental_count == locator.supplemental_count
+            and coverage.missing_twse_count == locator.missing_twse_count
+            and coverage.discrepancy_count == locator.discrepancy_count
+            and summary.supplemental_sources == locator.supplemental_sources
+            and identity.provenance_map_sha256 == locator.provenance_map_sha256
+        )
+        if not expected:
+            raise ScreenerCheckpointConflictError(
+                "candidate locator does not match the persisted dataset version"
+            )
 
     @classmethod
     def _artifact_role(
@@ -1374,7 +1905,13 @@ class SQLiteScreenerCheckpointRepository:
         provider = artifact.provider.casefold()
         canonical = {item.casefold() for item in provenance.canonical_sources}
         validation = {item.casefold() for item in provenance.validation_sources}
+        supplemental = {item.casefold() for item in provenance.supplemental_sources}
         if provider in ESUN_VALIDATION_SOURCES:
+            if provider in supplemental:
+                # v11's artifact table has no supplemental role; retain the
+                # source as a validation-shaped evidence row while the DS5
+                # metadata preserves its actual supplemental role.
+                return "validation"
             if provider not in validation:
                 raise CandidateSourcePolicyError(
                     "E.SUN artifact requires explicit validation provenance"
@@ -1398,7 +1935,9 @@ class SQLiteScreenerCheckpointRepository:
     def _validate_artifact(artifact: Stage2ArtifactRef) -> None:
         if not isinstance(artifact, Stage2ArtifactRef):
             raise CandidateSourcePolicyError("invalid candidate artifact reference")
-        if artifact.owner_kind not in {"pipeline", "historical", "validation"}:
+        if artifact.owner_kind not in {
+            "pipeline", "historical", "validation", "dataset_version"
+        }:
             raise CandidateSourcePolicyError("invalid artifact owner kind")
         for value, field_name in (
             (artifact.owner_run_id, "owner_run_id"),
@@ -1438,6 +1977,83 @@ class SQLiteScreenerCheckpointRepository:
                 "artifact": _artifact_dict(artifact),
             }
         )
+
+
+def _dataset_metadata_from_locators(
+    locators: tuple[CandidateInputLocator, ...],
+) -> dict[str, object]:
+    dual = tuple(item for item in locators if item.dataset_version_id is not None)
+    if not dual:
+        return {
+            "execution_status": "success",
+            "source_policy": TWSE_BASELINE_SOURCE_POLICY,
+            "source_status": "canonical_complete",
+            "research_data_quality": "canonical",
+            "authority_status": "complete",
+        "reconciliation_status": "not_applicable",
+        "supplemental_count": 0,
+        "supplemental_candidate_count": 0,
+        "supplemental_sources": "[]",
+            "twse_observation_count": 0,
+            "missing_twse_count": 0,
+            "discrepancy_count": 0,
+            "dataset_identity_sha256": None,
+            "provenance_map_sha256": None,
+            "dataset_version_ids_json": "[]",
+        }
+    policies = {item.source_policy for item in dual}
+    if policies != {"twse_dual_source_v1"} or len(dual) != len(locators):
+        raise ScreenerCheckpointConflictError(
+            "a Screener run cannot mix legacy and dual-source dataset locators"
+        )
+    qualities = {item.research_data_quality for item in dual}
+    quality = "provisional" if "provisional" in qualities else (
+        "reconciled" if "reconciled" in qualities else "canonical"
+    )
+    authorities = {item.authority_status for item in dual}
+    authority = "incomplete" if "incomplete" in authorities else (
+        "reconciled" if "reconciled" in authorities else "complete"
+    )
+    reconciliation_values = {item.reconciliation_status for item in dual}
+    if "pending" in reconciliation_values:
+        reconciliation = "pending"
+    elif "reconciled_discrepant" in reconciliation_values:
+        reconciliation = "reconciled_discrepant"
+    elif "reconciled_equal" in reconciliation_values:
+        reconciliation = "reconciled_equal"
+    else:
+        reconciliation = "not_applicable"
+    ordered = tuple(sorted(dual, key=lambda item: (item.symbol, item.dataset_version_id or "")))
+    return {
+        "execution_status": "provisional_success" if quality == "provisional" else "success",
+        "source_policy": "twse_dual_source_v1",
+        "source_status": (
+            "provisional_mixed" if quality == "provisional"
+            else ("reconciled" if quality == "reconciled" else "canonical_complete")
+        ),
+        "research_data_quality": quality,
+        "authority_status": authority,
+        "reconciliation_status": reconciliation,
+        "supplemental_count": sum(item.supplemental_count for item in ordered),
+        "supplemental_candidate_count": sum(
+            item.supplemental_count > 0 for item in ordered
+        ),
+        "supplemental_sources": _canonical_json(
+            sorted({source for item in ordered for source in item.supplemental_sources})
+        ),
+        "twse_observation_count": sum(item.twse_observation_count for item in ordered),
+        "missing_twse_count": sum(item.missing_twse_count for item in ordered),
+        "discrepancy_count": sum(item.discrepancy_count for item in ordered),
+        "dataset_identity_sha256": _canonical_sha256(
+            [item.identity_payload() for item in ordered]
+        ),
+        "provenance_map_sha256": _canonical_sha256(
+            [item.provenance_map_sha256 for item in ordered]
+        ),
+        "dataset_version_ids_json": _canonical_json(
+            [item.dataset_version_id for item in ordered]
+        ),
+    }
 
 
 def _stage1_reason_dict(reason: Stage1Reason) -> dict[str, object]:

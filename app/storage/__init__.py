@@ -53,6 +53,20 @@ from .operations import (
     health_status_for_operation,
     redact_operation_message,
 )
+from .dataset_versions import (
+    DatasetMigrationResult,
+    DatasetMigrationStateError,
+    DatasetPersistenceIntegrityError,
+    DatasetVersionMigrationRunner,
+    DatasetVersionNotFoundError,
+    DatasetVersionPersistenceResult,
+    DatasetVersionRepository,
+)
+from .reconciliation import (
+    DatasetReconciliationRepository,
+    ReconciliationPersistenceError,
+    ReconciliationPersistenceResult,
+)
 
 __all__ = [
     "PipelineRunConflictError",
@@ -96,4 +110,14 @@ __all__ = [
     "SchedulerInvocation",
     "health_status_for_operation",
     "redact_operation_message",
+    "DatasetMigrationResult",
+    "DatasetMigrationStateError",
+    "DatasetPersistenceIntegrityError",
+    "DatasetVersionMigrationRunner",
+    "DatasetVersionNotFoundError",
+    "DatasetVersionPersistenceResult",
+    "DatasetVersionRepository",
+    "DatasetReconciliationRepository",
+    "ReconciliationPersistenceError",
+    "ReconciliationPersistenceResult",
 ]

@@ -22,6 +22,7 @@ from .base import (
     ProviderTimeoutError,
 )
 from .artifacts import source_artifact_from_bytes
+from .http_limits import MAX_RETRY_AFTER_SECONDS
 from .twse import TwseHttpResponse, TwseHttpTransport, UrllibTwseHttpTransport
 
 
@@ -378,14 +379,17 @@ class TwseHistoricalMarketDataProvider(MarketDataProvider):
             return None
         normalized = value.strip()
         if normalized.isdigit():
-            return float(normalized)
+            return min(float(normalized), MAX_RETRY_AFTER_SECONDS)
         try:
             target = parsedate_to_datetime(normalized)
         except (TypeError, ValueError, OverflowError):
             return None
         if target.utcoffset() is None:
             target = target.replace(tzinfo=timezone.utc)
-        return max(0.0, (target - self.clock()).total_seconds())
+        return min(
+            max(0.0, (target - self.clock()).total_seconds()),
+            MAX_RETRY_AFTER_SECONDS,
+        )
 
     @staticmethod
     def _validate_envelope(payload: dict[str, object], *, query_date: str) -> None:

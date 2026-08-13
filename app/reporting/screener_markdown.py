@@ -4,12 +4,29 @@ from __future__ import annotations
 
 import json
 import re
+from contextvars import ContextVar
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_V1_RENDERING: ContextVar[bool] = ContextVar(
+    "screener_markdown_legacy_v1", default=False
+)
 
 
 def render_markdown(report: object, report_sha256: str) -> str:
+    """Render v1 with its frozen bytes and v2 with the current safe renderer."""
+
+    data = report.as_dict()
+    token = _LEGACY_V1_RENDERING.set(
+        data.get("report_contract_version") == "daily-screener-report.v1"
+    )
+    try:
+        return _render_markdown(report, report_sha256)
+    finally:
+        _LEGACY_V1_RENDERING.reset(token)
+
+
+def _render_markdown(report: object, report_sha256: str) -> str:
     """Render a report model without current time or free-form interpretation."""
 
     if not _SHA256.fullmatch(report_sha256):
@@ -41,6 +58,45 @@ def render_markdown(report: object, report_sha256: str) -> str:
         ("Screener canonical SHA-256", data["screener_canonical_sha256"]),
     )
     lines.extend(f"| {_cell(key)} | {_cell(value)} |" for key, value in summary_rows)
+    if data["report_contract_version"] == "daily-screener-report.v2":
+        quality = data["data_quality"]
+        banner = {
+            "canonical": "CANONICAL",
+            "provisional": "PROVISIONAL",
+            "reconciled": "RECONCILED",
+        }[quality]
+        lines.extend(
+            (
+                "",
+                f"## {banner}",
+                "",
+                f"> **{banner}** — canonical authority: `{_cell(data['canonical_authority'])}`; "
+                f"source status: `{_cell(data['source_status'])}`; "
+                f"reconciliation: `{_cell(data['reconciliation_status'])}`.",
+                "",
+                f"- Research data quality: `{_cell(quality)}`",
+                f"- Authority status: `{_cell(data['authority_status'])}`",
+                f"- Supplemental candidates: `{_cell(data['supplemental_candidate_count'])}/{_cell(data['candidate_count'])}`",
+                f"- Supplemental sources: `{_cell(', '.join(data['supplemental_sources']) or 'none')}`",
+                f"- TWSE coverage: `{_cell(data['twse_coverage'])}`",
+                f"- E.SUN supplemental count: `{_cell(data['esun_supplemental_count'])}`",
+                f"- Discrepancy count: `{_cell(data['discrepancy_count'])}`",
+            )
+        )
+        if quality == "provisional":
+            lines.extend(
+                (
+                    "",
+                    "> TWSE authority is incomplete; E.SUN rows are supplemental only and reconciliation is pending.",
+                )
+            )
+        elif data["reconciliation_status"] == "reconciled_discrepant":
+            lines.extend(
+                (
+                    "",
+                    "> Warning: reconciliation completed with persisted discrepancies; TWSE remains canonical authority.",
+                )
+            )
 
     lines.extend(("", "## Ranked Candidate Summary", "", _candidate_table(data)))
     for candidate in data["candidates"]:
@@ -225,7 +281,14 @@ def _cell(value: object) -> str:
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     else:
         text = str(value)
-    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    if _LEGACY_V1_RENDERING.get():
+        return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("`", "&#96;").replace("\\", "\\\\")
+    for character in "|[]()!*_~":
+        text = text.replace(character, "\\" + character)
+    return text
 
 
 __all__ = ["render_markdown"]

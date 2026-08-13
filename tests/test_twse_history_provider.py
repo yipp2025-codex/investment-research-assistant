@@ -245,6 +245,26 @@ def test_twse_historical_honors_retry_after_on_rate_limit() -> None:
     assert captured.value.retry_after_seconds == 7.0
 
 
+def test_twse_historical_caps_untrusted_retry_after() -> None:
+    with pytest.raises(ProviderTemporaryError) as captured:
+        _provider(
+            StubTransport(
+                _response(
+                    b"{}",
+                    status=429,
+                    headers={
+                        "content-type": "application/json",
+                        "retry-after": "999999999999999999999999",
+                    },
+                )
+            )
+        ).fetch_market_data(
+            "2330", date(2026, 4, 1), date(2026, 4, 30), timeout_seconds=1.0
+        )
+
+    assert captured.value.retry_after_seconds == 300.0
+
+
 def test_twse_historical_follows_one_official_semantics_preserving_redirect() -> None:
     redirected_url = (
         "https://wwwc.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"

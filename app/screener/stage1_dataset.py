@@ -10,6 +10,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import date
+from typing import Mapping
 
 from app.research_dataset import (
     ResearchDataset,
@@ -64,6 +65,7 @@ class Stage1DatasetScanEvidence:
     dataset_reads: int
     price_rows_consumed: int
     history_observations: int
+    dataset_version_ids: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.result, Stage1ScanResult):
@@ -87,6 +89,7 @@ def scan_stage1_from_dataset(
     as_of_date: date,
     candidate_limit: int,
     previous_valuations: tuple[PreviousValuationSnapshot, ...] = (),
+    dataset_version_ids: Mapping[str, str] | None = None,
     methodology: Stage1Methodology = STAGE1_METHODOLOGY_V1,
 ) -> Stage1DatasetScanEvidence:
     """Read every eligible symbol once, translate, then call the pure engine."""
@@ -117,6 +120,21 @@ def scan_stage1_from_dataset(
         if item.status is UniverseMemberStatus.ACTIVE_SCAN_ELIGIBLE
     )
     eligible_symbols = {item.symbol for item in eligible}
+    if dataset_version_ids is not None:
+        if not isinstance(dataset_version_ids, Mapping):
+            raise Stage1CompositionError("dataset_version_ids must be a symbol mapping")
+        extra_versions = set(dataset_version_ids) - eligible_symbols
+        if extra_versions:
+            raise Stage1CompositionError(
+                "dataset_version_ids contains symbols outside the scan universe: "
+                + ", ".join(sorted(extra_versions))
+            )
+        missing_versions = eligible_symbols - set(dataset_version_ids)
+        if missing_versions:
+            raise Stage1CompositionError(
+                "dataset_version_ids must explicitly cover every scan-eligible symbol: "
+                + ", ".join(sorted(missing_versions))
+            )
     extra_previous = set(previous_by_symbol) - eligible_symbols
     if extra_previous:
         raise Stage1CompositionError(
@@ -136,6 +154,11 @@ def scan_stage1_from_dataset(
             symbol=member.symbol,
             as_of_date=as_of_date,
             history_observations=methodology.history_observations,
+            dataset_version_id=(
+                None
+                if dataset_version_ids is None
+                else dataset_version_ids.get(member.symbol)
+            ),
         )
         dataset_snapshot = dataset.read(request)
         read_symbols.add(member.symbol)
@@ -159,6 +182,13 @@ def scan_stage1_from_dataset(
         dataset_reads=len(read_symbols),
         price_rows_consumed=price_rows_consumed,
         history_observations=methodology.history_observations,
+        dataset_version_ids=tuple(
+            sorted(
+                (symbol, value)
+                for symbol, value in (dataset_version_ids or {}).items()
+                if symbol in read_symbols
+            )
+        ),
     )
 
 
@@ -190,18 +220,29 @@ def screening_snapshot_from_dataset(
             trade_date=item.trade_date,
             close=item.close,
             volume=item.volume,
-            source=item.source,
+            # Stage 1's frozen source field describes the canonical
+            # authority family, while DS5 keeps the original source role and
+            # provider on the M9 row.  A selected provisional E.SUN row is
+            # therefore translated to the TWSE family for the pure Stage 1
+            # contract; provenance remains intact in the M9 snapshot.
+            source=(
+                item.source
+                if item.source in {"twse", "twse-historical"}
+                else "twse-historical"
+            ),
         )
         for item in snapshot.price_history.observations
     )
     current_valuation = _current_valuation_state(snapshot)
+    source_values = {
+        *snapshot.provenance.canonical_sources,
+        *(item.source for item in snapshot.price_history.observations),
+        *(item.source for item in snapshot.valuation.metrics),
+    }
     canonical_sources = tuple(
         sorted(
-            {
-                *snapshot.provenance.canonical_sources,
-                *(item.source for item in snapshot.price_history.observations),
-                *(item.source for item in snapshot.valuation.metrics),
-            }
+            source if source in {"twse", "twse-historical"} else "twse-historical"
+            for source in source_values
         )
     )
     if not canonical_sources:

@@ -29,6 +29,8 @@ from app.storage.screener_replay import (
 
 REPORT_CONTRACT_VERSION = "daily-screener-report.v1"
 REPORT_CONTENT_VERSION = "s6a-daily-screener-v1"
+REPORT_CONTRACT_VERSION_V2 = "daily-screener-report.v2"
+REPORT_CONTENT_VERSION_V2 = "s6a-daily-screener-v2"
 _REPORT_ID_VERSION = "daily-screener-report-id.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -186,9 +188,23 @@ class ScreenerReportProvenance:
     validation_sources: tuple[str, ...]
     evidence_refs: tuple[ScreenerReportEvidence, ...]
     discrepancies: tuple[ScreenerReportDiscrepancy, ...]
+    dataset_version_id: str | None = None
+    source_policy: str = "twse_baseline"
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    research_data_quality: str = "canonical"
+    canonical_authority: str = "twse"
+    supplemental_sources: tuple[str, ...] = ()
+    twse_observation_count: int = 0
+    esun_supplemental_count: int = 0
+    missing_twse_count: int = 0
+    discrepancy_count: int = 0
+    provenance_map_sha256: str | None = None
+    parent_dataset_version_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "pipeline_run_id": self.pipeline_run_id,
             "historical_run_id": self.historical_run_id,
             "validation_run_id": self.validation_run_id,
@@ -197,6 +213,26 @@ class ScreenerReportProvenance:
             "evidence_refs": [item.as_dict() for item in self.evidence_refs],
             "discrepancies": [item.as_dict() for item in self.discrepancies],
         }
+        if self.dataset_version_id is not None or self.research_data_quality != "canonical":
+            result.update(
+                {
+                    "dataset_version_id": self.dataset_version_id,
+                    "source_policy": self.source_policy,
+                    "source_status": self.source_status,
+                    "authority_status": self.authority_status,
+                    "reconciliation_status": self.reconciliation_status,
+                    "data_quality": self.research_data_quality,
+                    "canonical_authority": self.canonical_authority,
+                    "supplemental_sources": list(self.supplemental_sources),
+                    "twse_observation_count": self.twse_observation_count,
+                    "esun_supplemental_count": self.esun_supplemental_count,
+                    "missing_twse_count": self.missing_twse_count,
+                    "discrepancy_count": self.discrepancy_count,
+                    "provenance_map_sha256": self.provenance_map_sha256,
+                    "parent_dataset_version_id": self.parent_dataset_version_id,
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,9 +250,10 @@ class ScreenerReportCandidate:
     metrics: tuple[ScreenerReportMetric, ...]
     provenance: ScreenerReportProvenance
     failure: dict[str, str] | None
+    research_data_quality: str = "canonical"
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "rank": self.rank,
             "symbol": self.symbol,
             "name": self.name,
@@ -231,6 +268,9 @@ class ScreenerReportCandidate:
             "provenance": self.provenance.as_dict(),
             "failure": self.failure,
         }
+        if self.research_data_quality != "canonical" or self.provenance.dataset_version_id is not None:
+            result["data_quality"] = self.research_data_quality
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +295,21 @@ class ScreenerReport:
     screener_canonical_sha256: str
     candidates: tuple[ScreenerReportCandidate, ...]
     scope_disclaimers: tuple[str, ...]
+    execution_status: str = "success"
+    research_data_quality: str = "canonical"
+    canonical_authority: str = "twse"
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    supplemental_candidate_count: int = 0
+    supplemental_sources: tuple[str, ...] = ()
+    twse_observation_count: int = 0
+    esun_supplemental_count: int = 0
+    missing_twse_count: int = 0
+    discrepancy_count: int = 0
+    dataset_version_ids: tuple[str, ...] = ()
+    dataset_identity_sha256: str | None = None
+    provenance_map_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -264,14 +319,30 @@ class ScreenerReport:
             "screener_canonical_sha256",
         ):
             _require_sha256(getattr(self, field_name), field_name)
-        if self.report_contract_version != REPORT_CONTRACT_VERSION:
+        if self.report_contract_version not in {
+            REPORT_CONTRACT_VERSION,
+            REPORT_CONTRACT_VERSION_V2,
+        }:
             raise ScreenerReportContractError("unsupported report contract version")
-        if self.content_version != REPORT_CONTENT_VERSION:
+        expected_content = (
+            REPORT_CONTENT_VERSION_V2
+            if self.report_contract_version == REPORT_CONTRACT_VERSION_V2
+            else REPORT_CONTENT_VERSION
+        )
+        if self.content_version != expected_content:
             raise ScreenerReportContractError("unsupported report content version")
         if not isinstance(self.market_date, date):
             raise ScreenerReportContractError("market_date must be a date")
-        if self.source_policy != "twse_baseline":
+        if self.source_policy not in {"twse_baseline", "twse_dual_source_v1"}:
             raise ScreenerReportContractError("report source policy changed")
+        if self.execution_status not in {"success", "provisional_success"}:
+            raise ScreenerReportContractError("unsupported report execution status")
+        if self.research_data_quality not in {"canonical", "provisional", "reconciled"}:
+            raise ScreenerReportContractError("unsupported report data quality")
+        if self.research_data_quality == "provisional" and self.execution_status != "provisional_success":
+            raise ScreenerReportContractError("provisional report requires provisional_success")
+        if self.report_contract_version == REPORT_CONTRACT_VERSION_V2 and not self.dataset_version_ids:
+            raise ScreenerReportContractError("v2 report requires dataset version ids")
         for field_name in (
             "universe_count",
             "screened_count",
@@ -302,22 +373,33 @@ class ScreenerReport:
         if not isinstance(frozen, FrozenScreenerResult):
             raise TypeError("frozen must be a FrozenScreenerResult")
         candidates = tuple(_candidate_from_frozen(item) for item in frozen.candidates)
+        is_v2 = frozen.contract_version != "screener-frozen-result-v1"
+        report_contract = REPORT_CONTRACT_VERSION_V2 if is_v2 else REPORT_CONTRACT_VERSION
+        content_version = REPORT_CONTENT_VERSION_V2 if is_v2 else REPORT_CONTENT_VERSION
         identity = {
             "identity_version": _REPORT_ID_VERSION,
             "screener_run_id": frozen.screener_run_id,
-            "report_contract_version": REPORT_CONTRACT_VERSION,
-            "content_version": REPORT_CONTENT_VERSION,
+            "report_contract_version": report_contract,
+            "content_version": content_version,
         }
+        if is_v2:
+            identity.update(
+                {
+                    "dataset_identity_sha256": frozen.dataset_identity_sha256,
+                    "provenance_map_sha256": frozen.provenance_map_sha256,
+                    "dataset_version_ids": list(frozen.dataset_version_ids),
+                }
+            )
         return cls(
             report_id=_sha256(identity),
-            report_contract_version=REPORT_CONTRACT_VERSION,
-            content_version=REPORT_CONTENT_VERSION,
+            report_contract_version=report_contract,
+            content_version=content_version,
             market_date=frozen.market_date,
             screener_run_id=frozen.screener_run_id,
             universe_run_id=frozen.universe_run_id,
             stage1_methodology_version=frozen.stage1_methodology_version,
             stage2_methodology_version=frozen.stage2_methodology_version,
-            source_policy=frozen.source_policy,
+            source_policy=frozen.dataset_source_policy if is_v2 else frozen.source_policy,
             universe_count=frozen.universe_count,
             screened_count=frozen.screened_count,
             triggered_count=frozen.triggered_count,
@@ -327,10 +409,45 @@ class ScreenerReport:
             screener_canonical_sha256=frozen.payload_sha256,
             candidates=candidates,
             scope_disclaimers=SCOPE_DISCLAIMERS,
+            execution_status=frozen.execution_status,
+            research_data_quality=frozen.research_data_quality,
+            canonical_authority="twse",
+            source_status=frozen.source_status,
+            authority_status=frozen.authority_status,
+            reconciliation_status=frozen.reconciliation_status,
+            supplemental_candidate_count=frozen.supplemental_candidate_count,
+            supplemental_sources=tuple(
+                sorted(
+                    {
+                        source
+                        for candidate in frozen.candidates
+                        for source in candidate.provenance.supplemental_sources
+                    }
+                )
+            ),
+            twse_observation_count=sum(
+                candidate.provenance.twse_observation_count
+                for candidate in frozen.candidates
+            ),
+            esun_supplemental_count=sum(
+                candidate.provenance.esun_supplemental_count
+                for candidate in frozen.candidates
+            ),
+            missing_twse_count=sum(
+                candidate.provenance.missing_twse_count
+                for candidate in frozen.candidates
+            ),
+            discrepancy_count=sum(
+                candidate.provenance.discrepancy_count
+                for candidate in frozen.candidates
+            ),
+            dataset_version_ids=frozen.dataset_version_ids,
+            dataset_identity_sha256=frozen.dataset_identity_sha256,
+            provenance_map_sha256=frozen.provenance_map_sha256,
         )
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "report_contract_version": self.report_contract_version,
             "content_version": self.content_version,
             "report_id": self.report_id,
@@ -352,6 +469,29 @@ class ScreenerReport:
             "candidates": [item.as_dict() for item in self.candidates],
             "scope_disclaimers": list(self.scope_disclaimers),
         }
+        if self.report_contract_version == REPORT_CONTRACT_VERSION_V2:
+            result.update(
+                {
+                    "execution_status": self.execution_status,
+                    "data_quality": self.research_data_quality,
+                    "canonical_authority": self.canonical_authority,
+                    "source_status": self.source_status,
+                    "authority_status": self.authority_status,
+                    "reconciliation_status": self.reconciliation_status,
+                    "supplemental_candidate_count": self.supplemental_candidate_count,
+                    "supplemental_sources": list(self.supplemental_sources),
+                    "twse_coverage": {
+                        "twse_observation_count": self.twse_observation_count,
+                        "missing_twse_count": self.missing_twse_count,
+                    },
+                    "esun_supplemental_count": self.esun_supplemental_count,
+                    "discrepancy_count": self.discrepancy_count,
+                    "dataset_version_ids": list(self.dataset_version_ids),
+                    "dataset_identity_sha256": self.dataset_identity_sha256,
+                    "provenance_map_sha256": self.provenance_map_sha256,
+                }
+            )
+        return result
 
     def canonical_json(self) -> str:
         return _canonical_json(self.as_dict())
@@ -566,13 +706,23 @@ def _resolve_output_paths(
         raise ValueError("output_directory cannot be mixed with explicit paths")
     if output_directory is not None:
         directory = Path(output_directory)
-        stem = f"daily-screener-{generation.report.market_date.isoformat()}"
+        if generation.report.report_contract_version == REPORT_CONTRACT_VERSION_V2:
+            stem = (
+                f"daily-screener-{generation.report.market_date.isoformat()}-"
+                f"{generation.report.screener_run_id[:16]}-v2"
+            )
+        else:
+            stem = f"daily-screener-{generation.report.market_date.isoformat()}"
         return directory / f"{stem}.json", directory / f"{stem}.md"
     if json_path is None or markdown_path is None:
         raise ValueError(
             "provide output_directory or both json_path and markdown_path"
         )
-    return Path(json_path), Path(markdown_path)
+    json_target = Path(json_path).resolve(strict=False)
+    markdown_target = Path(markdown_path).resolve(strict=False)
+    if json_target == markdown_target:
+        raise ValueError("json_path and markdown_path must be distinct files")
+    return json_target, markdown_target
 
 
 def _candidate_from_frozen(candidate: object) -> ScreenerReportCandidate:
@@ -627,6 +777,20 @@ def _candidate_from_frozen(candidate: object) -> ScreenerReportCandidate:
                 )
                 for item in candidate.data_quality.discrepancies
             ),
+            dataset_version_id=provenance.dataset_version_id,
+            source_policy=provenance.source_policy,
+            source_status=provenance.source_status,
+            authority_status=provenance.authority_status,
+            reconciliation_status=provenance.reconciliation_status,
+            research_data_quality=provenance.research_data_quality,
+            canonical_authority=provenance.canonical_authority,
+            supplemental_sources=provenance.supplemental_sources,
+            twse_observation_count=provenance.twse_observation_count,
+            esun_supplemental_count=provenance.esun_supplemental_count,
+            missing_twse_count=provenance.missing_twse_count,
+            discrepancy_count=provenance.discrepancy_count,
+            provenance_map_sha256=provenance.provenance_map_sha256,
+            parent_dataset_version_id=provenance.parent_dataset_version_id,
         ),
         failure=(
             None
@@ -637,6 +801,7 @@ def _candidate_from_frozen(candidate: object) -> ScreenerReportCandidate:
                 "error_type": candidate.failure.error_type,
             }
         ),
+        research_data_quality=provenance.research_data_quality,
     )
 
 
@@ -728,7 +893,9 @@ def _require_sha256(value: object, field_name: str) -> str:
 
 __all__ = [
     "REPORT_CONTENT_VERSION",
+    "REPORT_CONTENT_VERSION_V2",
     "REPORT_CONTRACT_VERSION",
+    "REPORT_CONTRACT_VERSION_V2",
     "SCOPE_DISCLAIMERS",
     "ScreenerReport",
     "ScreenerReportArtifact",

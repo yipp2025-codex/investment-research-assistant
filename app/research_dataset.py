@@ -27,7 +27,14 @@ _SENSITIVE_QUERY_KEYS = frozenset(
     {
         "api_key",
         "apikey",
+        "access_token",
+        "api_token",
+        "api-token",
+        "x-api-key",
+        "x_api_key",
         "authorization",
+        "auth",
+        "bearer",
         "credential",
         "credentials",
         "key",
@@ -35,6 +42,10 @@ _SENSITIVE_QUERY_KEYS = frozenset(
         "secret",
         "signature",
         "token",
+        "client_secret",
+        "private_key",
+        "x-amz-credential",
+        "x-amz-signature",
     }
 )
 
@@ -53,6 +64,7 @@ class ResearchDatasetRequest:
     pipeline_run_id: str | None = None
     historical_run_id: str | None = None
     validation_run_id: str | None = None
+    dataset_version_id: str | None = None
     source_policy: str = field(
         default=TWSE_BASELINE_SOURCE_POLICY,
         init=False,
@@ -75,6 +87,7 @@ class ResearchDatasetRequest:
             "pipeline_run_id",
             "historical_run_id",
             "validation_run_id",
+            "dataset_version_id",
         ):
             object.__setattr__(
                 self,
@@ -122,6 +135,7 @@ class DatasetPrice:
     close: float
     volume: int
     source: str
+    source_role: str = "canonical"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
@@ -147,6 +161,8 @@ class DatasetPrice:
         if self.low > min(self.open, self.high, self.close):
             raise ValueError("low must be at most open, high, and close")
         object.__setattr__(self, "source", _normalize_source(self.source))
+        if self.source_role not in {"canonical", "supplemental", "validation"}:
+            raise ValueError("source_role is unsupported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,7 +479,7 @@ class DatasetArtifactRef:
     fetched_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        if self.owner_kind not in {"pipeline", "historical", "validation"}:
+        if self.owner_kind not in {"pipeline", "historical", "validation", "dataset_version"}:
             raise ValueError("unsupported artifact owner_kind")
         object.__setattr__(
             self,
@@ -511,13 +527,71 @@ class DatasetProvenance:
     source_endpoints: tuple[str, ...] = ()
     artifact_refs: tuple[DatasetArtifactRef, ...] = ()
     fetched_at: datetime | None = None
-    source_policy: str = field(
-        default=TWSE_BASELINE_SOURCE_POLICY,
-        init=False,
-    )
+    source_policy: str = TWSE_BASELINE_SOURCE_POLICY
+    dataset_version_id: str | None = None
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    research_data_quality: str = "canonical"
+    canonical_authority: str = "twse"
+    supplemental_sources: tuple[str, ...] = ()
+    twse_observation_count: int = 0
+    esun_supplemental_count: int = 0
+    missing_twse_count: int = 0
+    discrepancy_count: int = 0
+    provenance_map_sha256: str | None = None
+    parent_dataset_version_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "symbol", _normalize_symbol(self.symbol))
+        if self.source_policy not in {
+            TWSE_BASELINE_SOURCE_POLICY,
+            "twse_dual_source_v1",
+        }:
+            raise DatasetSourcePolicyError("unsupported dataset source policy")
+        if self.dataset_version_id is not None:
+            if not _SHA256.fullmatch(self.dataset_version_id):
+                raise ValueError("dataset_version_id must be lowercase SHA-256")
+            if self.source_policy != "twse_dual_source_v1":
+                raise DatasetSourcePolicyError(
+                    "dataset_version_id requires the dual-source policy"
+                )
+        if self.source_status not in {
+            "canonical_complete",
+            "provisional_mixed",
+            "reconciled",
+        }:
+            raise ValueError("unsupported source_status")
+        if self.authority_status not in {"complete", "incomplete", "reconciled"}:
+            raise ValueError("unsupported authority_status")
+        if self.reconciliation_status not in {
+            "not_applicable",
+            "pending",
+            "reconciled_equal",
+            "reconciled_discrepant",
+        }:
+            raise ValueError("unsupported reconciliation_status")
+        if self.research_data_quality not in {"canonical", "provisional", "reconciled"}:
+            raise ValueError("unsupported research_data_quality")
+        if self.canonical_authority != "twse":
+            raise DatasetSourcePolicyError("canonical authority must remain twse")
+        for name in (
+            "twse_observation_count",
+            "esun_supplemental_count",
+            "missing_twse_count",
+            "discrepancy_count",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.provenance_map_sha256 is not None and not _SHA256.fullmatch(
+            self.provenance_map_sha256
+        ):
+            raise ValueError("provenance_map_sha256 must be lowercase SHA-256")
+        if self.parent_dataset_version_id is not None and not _SHA256.fullmatch(
+            self.parent_dataset_version_id
+        ):
+            raise ValueError("parent_dataset_version_id must be lowercase SHA-256")
         for name in (
             "pipeline_run_id",
             "historical_run_id",
@@ -537,6 +611,11 @@ class DatasetProvenance:
             self,
             "validation_sources",
             tuple(sorted({_normalize_source(item) for item in self.validation_sources})),
+        )
+        object.__setattr__(
+            self,
+            "supplemental_sources",
+            tuple(sorted({_normalize_source(item) for item in self.supplemental_sources})),
         )
         object.__setattr__(
             self,
@@ -584,10 +663,7 @@ class DatasetAsOf:
     total_history_observations: int
     returned_history_observations: int
     history_is_truncated: bool
-    source_policy: str = field(
-        default=TWSE_BASELINE_SOURCE_POLICY,
-        init=False,
-    )
+    source_policy: str = TWSE_BASELINE_SOURCE_POLICY
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -595,6 +671,11 @@ class DatasetAsOf:
             "as_of_date",
             _require_date(self.as_of_date, "as_of_date"),
         )
+        if self.source_policy not in {
+            TWSE_BASELINE_SOURCE_POLICY,
+            "twse_dual_source_v1",
+        }:
+            raise DatasetSourcePolicyError("unsupported as_of source policy")
         if self.history_observations is not None and (
             isinstance(self.history_observations, bool)
             or not isinstance(self.history_observations, int)
@@ -709,6 +790,70 @@ class TwseBaselineSourcePolicy:
         )
 
 
+def _validate_dual_source_models(
+    *,
+    history: PriceHistoryReadModel,
+    valuation: ValuationReadModel,
+    validation: ValidationReadModel,
+    provenance: DatasetProvenance,
+) -> None:
+    """Validate the DS5 read model without changing the frozen M9 math."""
+
+    if provenance.dataset_version_id is None:
+        raise DatasetSourcePolicyError(
+            "dual-source snapshots require an explicit dataset_version_id"
+        )
+    canonical = {
+        *provenance.canonical_sources,
+        *(item.source for item in history.observations if item.source_role == "canonical"),
+        *(item.source for item in valuation.metrics),
+    }
+    supplemental = {
+        *provenance.supplemental_sources,
+        *(item.source for item in history.observations if item.source_role == "supplemental"),
+    }
+    validation_sources = {
+        *provenance.validation_sources,
+        *(item.provider for item in validation.observations),
+        *(item for item in (validation.left_provider, validation.right_provider) if item),
+    }
+    if not canonical or not canonical <= TWSE_BASELINE_SOURCES:
+        raise DatasetSourcePolicyError(
+            "dual-source canonical observations must remain TWSE-authoritative"
+        )
+    if supplemental and not supplemental <= {"esun", "esun-historical"}:
+        raise DatasetSourcePolicyError(
+            "dual-source supplemental observations must remain E.SUN-only"
+        )
+    if not validation_sources <= (TWSE_BASELINE_SOURCES | _FORMAL_VALIDATION_SOURCES):
+        raise DatasetSourcePolicyError("dual-source validation source is unsupported")
+    if any(item.source_role == "validation" for item in history.observations):
+        raise DatasetSourcePolicyError("validation rows must not enter selected history")
+    if provenance.esun_supplemental_count != len(
+        [item for item in history.observations if item.source_role == "supplemental"]
+    ):
+        raise DatasetSourcePolicyError("supplemental coverage count is inconsistent")
+    expected_quality = {
+        "canonical_complete": ("complete", "not_applicable", "canonical"),
+        "provisional_mixed": ("incomplete", "pending", "provisional"),
+        "reconciled": ("reconciled", None, "reconciled"),
+    }
+    expected = expected_quality[provenance.source_status]
+    if provenance.authority_status != expected[0] or provenance.research_data_quality != expected[2]:
+        raise DatasetSourcePolicyError("dataset status and research data quality disagree")
+    if expected[1] is not None and provenance.reconciliation_status != expected[1]:
+        raise DatasetSourcePolicyError("dataset status and reconciliation status disagree")
+    if provenance.source_status == "reconciled" and provenance.reconciliation_status not in {
+        "reconciled_equal",
+        "reconciled_discrepant",
+    }:
+        raise DatasetSourcePolicyError("reconciled dataset requires a reconciliation result")
+    if provenance.source_status == "canonical_complete" and supplemental:
+        raise DatasetSourcePolicyError("canonical-complete dataset cannot contain supplemental rows")
+    if provenance.source_status == "reconciled" and supplemental:
+        raise DatasetSourcePolicyError("reconciled dataset cannot select supplemental rows")
+
+
 @dataclass(frozen=True, slots=True)
 class ResearchDatasetSnapshot:
     """Complete immutable read result for one symbol and as-of request."""
@@ -757,12 +902,24 @@ class ResearchDatasetSnapshot:
             for item in self.validation.observations
         ):
             raise ValueError("validation must not contain future observations")
-        TwseBaselineSourcePolicy.validate_models(
-            history=self.price_history,
-            valuation=self.valuation,
-            validation=self.validation,
-            provenance=self.provenance,
-        )
+        if self.provenance.source_policy == TWSE_BASELINE_SOURCE_POLICY:
+            TwseBaselineSourcePolicy.validate_models(
+                history=self.price_history,
+                valuation=self.valuation,
+                validation=self.validation,
+                provenance=self.provenance,
+            )
+        else:
+            _validate_dual_source_models(
+                history=self.price_history,
+                valuation=self.valuation,
+                validation=self.validation,
+                provenance=self.provenance,
+            )
+        if self.as_of.source_policy != self.provenance.source_policy:
+            raise DatasetSourcePolicyError(
+                "snapshot as_of and provenance source policies must match"
+            )
 
 
 @runtime_checkable
@@ -962,6 +1119,7 @@ class FakeResearchDataset:
             total_history_observations=len(eligible_prices),
             returned_history_observations=len(returned_prices),
             history_is_truncated=len(returned_prices) < len(eligible_prices),
+            source_policy=provenance.source_policy,
         )
         return ResearchDatasetSnapshot(
             symbol=symbol,

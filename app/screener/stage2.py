@@ -35,6 +35,9 @@ from app.screener.stage1 import (
 )
 
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 STAGE2_METHODOLOGY_VERSION = "screener-stage2-v1"
 
 RETURN_20D = "return_20d"
@@ -496,6 +499,20 @@ class Stage2Provenance:
     canonical_sources: tuple[str, ...]
     validation_sources: tuple[str, ...]
     artifact_refs: tuple[Stage2ArtifactRef, ...]
+    source_policy: str = TWSE_BASELINE_SOURCE_POLICY
+    dataset_version_id: str | None = None
+    source_status: str = "canonical_complete"
+    authority_status: str = "complete"
+    reconciliation_status: str = "not_applicable"
+    research_data_quality: str = "canonical"
+    canonical_authority: str = "twse"
+    supplemental_sources: tuple[str, ...] = ()
+    twse_observation_count: int = 0
+    esun_supplemental_count: int = 0
+    missing_twse_count: int = 0
+    discrepancy_count: int = 0
+    provenance_map_sha256: str | None = None
+    parent_dataset_version_id: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -513,6 +530,42 @@ class Stage2Provenance:
             if not isinstance(value, tuple):
                 raise Stage2ContractError(f"{field_name} must be immutable")
             object.__setattr__(self, field_name, tuple(sorted(set(value))))
+        if self.source_policy not in {TWSE_BASELINE_SOURCE_POLICY, "twse_dual_source_v1"}:
+            raise Stage2ContractError("source_policy is unsupported")
+        if self.dataset_version_id is not None and _SHA256_RE.fullmatch(self.dataset_version_id) is None:
+            raise Stage2ContractError("dataset_version_id must be lowercase SHA-256")
+        if self.dataset_version_id is not None and self.source_policy != "twse_dual_source_v1":
+            raise Stage2ContractError("dataset_version_id requires the dual-source policy")
+        if self.source_policy == "twse_dual_source_v1" and self.dataset_version_id is None:
+            raise Stage2ContractError("dual-source provenance requires dataset_version_id")
+        if self.source_status not in {"canonical_complete", "provisional_mixed", "reconciled"}:
+            raise Stage2ContractError("source_status is unsupported")
+        if self.authority_status not in {"complete", "incomplete", "reconciled"}:
+            raise Stage2ContractError("authority_status is unsupported")
+        if self.reconciliation_status not in {
+            "not_applicable", "pending", "reconciled_equal", "reconciled_discrepant"
+        }:
+            raise Stage2ContractError("reconciliation_status is unsupported")
+        if self.research_data_quality not in {"canonical", "provisional", "reconciled"}:
+            raise Stage2ContractError("research_data_quality is unsupported")
+        if self.canonical_authority != "twse":
+            raise Stage2ContractError("canonical authority must remain twse")
+        for field_name in (
+            "twse_observation_count", "esun_supplemental_count",
+            "missing_twse_count", "discrepancy_count",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise Stage2ContractError(f"{field_name} must be non-negative")
+        if self.provenance_map_sha256 is not None and _SHA256_RE.fullmatch(self.provenance_map_sha256) is None:
+            raise Stage2ContractError("provenance_map_sha256 must be lowercase SHA-256")
+        if self.parent_dataset_version_id is not None and _SHA256_RE.fullmatch(self.parent_dataset_version_id) is None:
+            raise Stage2ContractError("parent_dataset_version_id must be lowercase SHA-256")
+        object.__setattr__(
+            self,
+            "supplemental_sources",
+            tuple(sorted(set(self.supplemental_sources))),
+        )
         if not isinstance(self.artifact_refs, tuple):
             raise Stage2ContractError("artifact_refs must be immutable")
 
@@ -1237,6 +1290,20 @@ def _provenance(snapshot: ResearchDatasetSnapshot) -> Stage2Provenance:
         canonical_sources=value.canonical_sources,
         validation_sources=value.validation_sources,
         artifact_refs=tuple(_artifact(item) for item in value.artifact_refs),
+        source_policy=value.source_policy,
+        dataset_version_id=value.dataset_version_id,
+        source_status=value.source_status,
+        authority_status=value.authority_status,
+        reconciliation_status=value.reconciliation_status,
+        research_data_quality=value.research_data_quality,
+        canonical_authority=value.canonical_authority,
+        supplemental_sources=value.supplemental_sources,
+        twse_observation_count=value.twse_observation_count,
+        esun_supplemental_count=value.esun_supplemental_count,
+        missing_twse_count=value.missing_twse_count,
+        discrepancy_count=value.discrepancy_count,
+        provenance_map_sha256=value.provenance_map_sha256,
+        parent_dataset_version_id=value.parent_dataset_version_id,
     )
 
 
@@ -1444,7 +1511,7 @@ def _quality_dict(value: Stage2DataQuality) -> dict[str, object]:
 
 
 def _provenance_dict(value: Stage2Provenance) -> dict[str, object]:
-    return {
+    result = {
         "pipeline_run_id": value.pipeline_run_id,
         "historical_run_id": value.historical_run_id,
         "validation_run_id": value.validation_run_id,
@@ -1465,6 +1532,22 @@ def _provenance_dict(value: Stage2Provenance) -> dict[str, object]:
             for item in value.artifact_refs
         ],
     }
+    if value.dataset_version_id is not None or value.research_data_quality != "canonical":
+        result["dataset_version_id"] = value.dataset_version_id
+        result["source_policy"] = value.source_policy
+        result["source_status"] = value.source_status
+        result["authority_status"] = value.authority_status
+        result["reconciliation_status"] = value.reconciliation_status
+        result["research_data_quality"] = value.research_data_quality
+        result["canonical_authority"] = value.canonical_authority
+        result["supplemental_sources"] = list(value.supplemental_sources)
+        result["twse_observation_count"] = value.twse_observation_count
+        result["esun_supplemental_count"] = value.esun_supplemental_count
+        result["missing_twse_count"] = value.missing_twse_count
+        result["discrepancy_count"] = value.discrepancy_count
+        result["provenance_map_sha256"] = value.provenance_map_sha256
+        result["parent_dataset_version_id"] = value.parent_dataset_version_id
+    return result
 
 
 def _failure_dict(value: Stage2Failure | None) -> dict[str, object] | None:

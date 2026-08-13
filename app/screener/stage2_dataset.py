@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from typing import Mapping
 
 from app.research_dataset import ResearchDataset, ResearchDatasetRequest
 from app.screener.stage1 import Stage1ScanResult
@@ -30,6 +31,7 @@ class Stage2DatasetResearchEvidence:
     observations_consumed: int
     failed_candidates: int
     history_observations: int
+    dataset_version_ids: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.result, Stage2CandidateResult):
@@ -61,6 +63,7 @@ def research_stage2_from_dataset(
     stage1_result: Stage1ScanResult,
     dataset: ResearchDataset,
     market_date: date,
+    dataset_version_ids: Mapping[str, str] | None = None,
     methodology: Stage2Methodology = STAGE2_METHODOLOGY_V1,
 ) -> Stage2DatasetResearchEvidence:
     """Research only the immutable Stage 1 shortlist, once per candidate."""
@@ -71,6 +74,24 @@ def research_stage2_from_dataset(
         raise Stage2CompositionError("composition requires frozen Stage 2 v1")
     if stage1_result.market_date != market_date:
         raise Stage2CompositionError("Stage 1 and Stage 2 market_date differ")
+    if dataset_version_ids is not None:
+        if not isinstance(dataset_version_ids, Mapping):
+            raise Stage2CompositionError("dataset_version_ids must be a symbol mapping")
+        extra_versions = set(dataset_version_ids) - {
+            item.symbol for item in stage1_result.candidates
+        }
+        if extra_versions:
+            raise Stage2CompositionError(
+                "dataset_version_ids contains symbols outside the Stage 1 shortlist: "
+                + ", ".join(sorted(extra_versions))
+            )
+        shortlist_symbols = {item.symbol for item in stage1_result.candidates}
+        missing_versions = shortlist_symbols - set(dataset_version_ids)
+        if missing_versions:
+            raise Stage2CompositionError(
+                "dataset_version_ids must explicitly cover every Stage 1 candidate: "
+                + ", ".join(sorted(missing_versions))
+            )
 
     drafts = []
     read_symbols: set[str] = set()
@@ -87,6 +108,11 @@ def research_stage2_from_dataset(
                     symbol=candidate.symbol,
                     as_of_date=market_date,
                     history_observations=methodology.history_observations,
+                    dataset_version_id=(
+                        None
+                        if dataset_version_ids is None
+                        else dataset_version_ids.get(candidate.symbol)
+                    ),
                 )
             )
             observations_consumed += len(snapshot.price_history.observations)
@@ -118,4 +144,11 @@ def research_stage2_from_dataset(
             for item in result.candidates
         ),
         history_observations=methodology.history_observations,
+        dataset_version_ids=tuple(
+            sorted(
+                (symbol, value)
+                for symbol, value in (dataset_version_ids or {}).items()
+                if symbol in read_symbols
+            )
+        ),
     )
