@@ -10,9 +10,12 @@ investment advice.
 ## v1.1 highlights
 
 - Dual-source resilience while preserving TWSE as the canonical authority.
-- Qualified E.SUN supplemental observations only when the frozen eligibility
-  contract passes; E.SUN never becomes canonical and identity validation stays
-  strict.
+- Pluggable secondary market-data providers may participate in validation and
+  qualified supplemental coverage under strict identity, provenance,
+  eligibility, security, and fail-closed contracts.
+- E.SUN is one currently supported secondary-provider adapter; its observations
+  are qualified supplemental or validation evidence only. It is not part of
+  the canonical authority contract.
 - Per-observation provider role, source-run, artifact, and provenance hashes.
 - Immutable provisional datasets for temporary TWSE gaps and immutable
   reconciled child datasets when TWSE observations arrive later.
@@ -27,8 +30,10 @@ investment advice.
 
 - TWSE market data is read only from the official endpoints documented under
   `docs/`.
-- E.SUN is a qualified supplemental or validation source under the dual-source
-  contract; it cannot replace TWSE canonical observations.
+- TWSE plus a qualified secondary provider is the dual-source resilience
+  pattern; a secondary provider cannot replace TWSE canonical observations.
+- E.SUN is the currently supported adapter implementation for that secondary
+  role, not a permanent architectural requirement.
 - `MockMarketDataProvider` produces synthetic test data and is never presented
   as real market data.
 - Credentials are loaded only from process configuration or an ignored local
@@ -56,7 +61,7 @@ commands are explicit and are not required for the normal test run.
 - [`docs/twse-openapi-contract.md`](docs/twse-openapi-contract.md) — official
   TWSE endpoint boundary.
 - [`docs/esun-marketdata-contract.md`](docs/esun-marketdata-contract.md) —
-  optional E.SUN source boundary.
+  E.SUN adapter-specific source boundary.
 
 ## License
 

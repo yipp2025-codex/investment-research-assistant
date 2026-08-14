@@ -1,4 +1,4 @@
-"""Resumable TWSE/E.SUN source-preserving market-data comparison."""
+"""Resumable provider-pair source-preserving market-data comparison."""
 
 from __future__ import annotations
 

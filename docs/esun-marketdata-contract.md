@@ -14,6 +14,20 @@
 
 本階段只使用官方 `esun_marketdata` 證券行情功能。不得 import `esun_trade`，不得呼叫委託、刪改單、帳務或任何交易方法。官方明確說明行情 API 不區分正式／模擬環境，因此交易 API 的模擬下單流程不是行情串接的前置條件。
 
+## 架構角色
+
+本文件描述目前支援的 E.SUN adapter implementation，不是 canonical authority
+契約本身：
+
+- TWSE 保持 canonical authority。
+- Secondary market-data provider 是可替換的 validation／qualified supplemental
+  角色；E.SUN 是目前其中一個支援的 adapter。
+- 任一未來 adapter 都必須通過 identity verification、normalized observation
+  contract、supplemental eligibility、provenance、security boundary 與
+  fail-closed 語意，才能加入相同角色。
+- 本 public build 的 provider identity allowlist 仍是顯式且有限的；新增 adapter
+  需要另行修改實作、契約與 regression tests，不會因文件描述而自動開放。
+
 ## 官方 SDK 與驗證契約
 
 - Windows wheel：`esun_marketdata-2.2.0-cp37-abi3-win_amd64.whl`。
@@ -26,7 +40,7 @@
 
 專案只由 `ESUN_MARKETDATA_CONFIG_PATH` 或命令列參數接收「被 Git 忽略且位於 repo 外的設定檔路徑」。設定內容、帳號、Key、Secret、憑證路徑、SDK token 與密碼不得進入程式、fixture、SQLite、文件或 log。
 
-官方 SDK 登入後回傳的 REST origin 在本次驗證為 `https://api.fugle.tw/marketdata/v1.0/stock`。玉山官方行情簡介亦說明資料服務技術來源；實作只接受由已驗證 SDK 動態取得、且 host/path 完全符合本契約的 HTTPS URL，不把它當成另一個可任意替換的第三方 Provider。SDK 只負責官方登入／token exchange；每個市場資料 GET 由 transport 加入 timeout，且只送出一次。
+官方 SDK 登入後回傳的 REST origin 在本次驗證為 `https://api.fugle.tw/marketdata/v1.0/stock`。玉山官方行情簡介亦說明資料服務技術來源；本 E.SUN adapter 只接受由已驗證 SDK 動態取得、且 host/path 完全符合本契約的 HTTPS URL，不把它當成可任意替換的 endpoint。SDK 只負責官方登入／token exchange；每個市場資料 GET 由 transport 加入 timeout，且只送出一次。
 
 ## Live fixture 證據
 

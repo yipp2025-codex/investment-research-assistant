@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Clarified that dual-source resilience means TWSE canonical authority plus a
+  qualified, pluggable secondary market-data provider; E.SUN remains one
+  supported adapter rather than a permanent architectural requirement.
+
 ## 1.1.0 — 2026-08-13
 
 - Added resilient dual-source research datasets with TWSE canonical authority
