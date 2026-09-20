@@ -9,38 +9,43 @@ investment advice.
 
 ## v1.1 highlights
 
-- Dual-source resilience while preserving TWSE as the canonical authority.
-- Pluggable secondary market-data providers may participate in validation and
-  qualified supplemental coverage under strict identity, provenance,
-  eligibility, security, and fail-closed contracts.
-- E.SUN is one currently supported secondary-provider adapter; its observations
-  are qualified supplemental or validation evidence only. It is not part of
-  the canonical authority contract.
-- Per-observation provider role, source-run, artifact, and provenance hashes.
-- Immutable provisional datasets for temporary TWSE gaps and immutable
-  reconciled child datasets when TWSE observations arrive later.
-- Legal-short listing-history coverage derived from authoritative listing
+- TWSE remains the canonical authority for market-data observations used by
+  research output.
+- The current build supports E.SUN as a secondary provider for validation and
+  bounded supplemental coverage under explicit identity, provenance,
+  eligibility, security, and fail-closed checks.
+- E.SUN never becomes canonical, and its data cannot replace or overwrite an
+  existing canonical TWSE observation.
+- There is no implicit or automatic provider fallback. Supplemental recovery
+  is available only when the documented eligibility conditions are satisfied;
+  otherwise the pipeline fails closed.
+- Provisional datasets make qualified supplemental coverage explicit, and a
+  later reconciliation creates a new immutable child without rewriting its
+  provisional parent.
+- Legal-short listing-history coverage is derived from authoritative listing
   evidence rather than a hard-coded observation count.
-- Additive SQLite schema v12 support through migration `0012`; legacy v1
-  semantics and strict replay remain separate and compatible.
-- Deterministic local fixtures and bounded provider protections for redirects,
-  credentials, response size, deadlines, and retries.
+- Deterministic local fixtures and bounded provider protections cover
+  redirects, credentials, response size, deadlines, and retries.
 
 ## Data and safety boundaries
 
 - TWSE market data is read only from the official endpoints documented under
   `docs/`.
-- TWSE plus a qualified secondary provider is the dual-source resilience
-  pattern; a secondary provider cannot replace TWSE canonical observations.
-- E.SUN is the currently supported adapter implementation for that secondary
-  role, not a permanent architectural requirement.
+- A complete TWSE path produces canonical research data. E.SUN may validate
+  that data, but validation does not select a winning provider or rewrite
+  canonical values.
+- A qualified supplemental path may cover an eligible TWSE gap in a clearly
+  marked provisional research dataset. It is not an unrestricted substitute
+  for TWSE and cannot make E.SUN canonical.
+- E.SUN is the currently supported secondary adapter for this contract; its
+  presence does not make it a permanent architectural requirement.
 - `MockMarketDataProvider` produces synthetic test data and is never presented
   as real market data.
 - Credentials are loaded only from process configuration or an ignored local
   `.env`; credentials, databases, reports, backups, and runtime state do not
   belong in Git.
-- Invalid payloads, identity mismatches, normalization failures, and permanent
-  provider errors fail closed.
+- Invalid payloads, identity mismatches, normalization failures, and
+  ineligible or permanent provider errors fail closed.
 
 ## Quick start
 
@@ -57,7 +62,7 @@ commands are explicit and are not required for the normal test run.
 ## Documentation
 
 - [`docs/dual-source-resilience.md`](docs/dual-source-resilience.md) — public
-  v1.1 contract overview.
+  v1.1 dual-source contract and dataset lifecycle.
 - [`docs/twse-openapi-contract.md`](docs/twse-openapi-contract.md) — official
   TWSE endpoint boundary.
 - [`docs/esun-marketdata-contract.md`](docs/esun-marketdata-contract.md) —

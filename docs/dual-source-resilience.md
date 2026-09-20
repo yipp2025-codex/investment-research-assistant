@@ -1,53 +1,68 @@
-# v1.1 Dual-Source Resilience
+# v1.1 Dual-Source Research Contract
 
-The v1.1 contract extends the read-only research pipeline without changing
-legacy `twse_baseline` semantics.
+The v1.1 contract adds bounded resilience to the read-only research pipeline
+while preserving TWSE authority and the existing TWSE-only research behavior.
 
 ## Authority and roles
 
-- TWSE remains the canonical authority for selected research observations.
-- A secondary market-data provider is a pluggable role. It may participate in
-  validation or qualified supplemental coverage only after the normalized
-  observation, identity, provenance, eligibility, security, and fail-closed
-  contracts pass.
-- E.SUN is one currently supported secondary-provider adapter. Its observations
-  can be supplemental or validation evidence, but they are never relabeled as
-  canonical.
-- A future broker or market-data adapter may fill the same secondary role only
-  after it implements the existing `MarketDataProvider` boundary and receives
-  its own contract, identity, provenance, and regression review.
-- The current public build uses explicit built-in provider allowlists; it does
-  not silently accept arbitrary provider identifiers. Adding another adapter
-  therefore requires a separate implementation and contract change.
-- A provider identity mismatch, malformed payload, or credential-bearing
-  artifact reference is rejected fail closed.
+- TWSE is the canonical market-data source for selected research observations.
+  Canonical TWSE values remain authoritative.
+- E.SUN is a supported secondary provider with two explicitly different roles:
+  validation and qualified supplemental coverage.
+- In the validation role, E.SUN observations are compared or recorded as
+  independent evidence. They do not select a winning source and do not rewrite
+  canonical TWSE-derived research data.
+- In the qualified supplemental role, E.SUN may cover a bounded TWSE gap only
+  after the provider identity, normalized observation, provenance, security,
+  and eligibility checks pass. Supplemental observations are marked as such
+  and never become canonical.
+- E.SUN cannot replace an existing canonical TWSE observation, and a TWSE
+  failure by itself does not authorize substitution.
+
+## Normal and recovery paths
+
+1. A complete TWSE history follows the normal canonical path and produces a
+   TWSE-derived canonical research dataset.
+2. A complete TWSE result may be accompanied by E.SUN validation. The
+   validation path does not change the canonical dataset or choose a provider
+   winner.
+3. If TWSE has a gap in a category eligible for supplemental recovery, the
+   explicitly gated recovery path may create a bounded provisional dataset
+   containing the available canonical TWSE observations and clearly marked
+   supplemental observations from E.SUN.
+4. If any required safety or eligibility check fails, the recovery path fails
+   closed. It does not silently fall back, return E.SUN as canonical, or
+   replace an existing TWSE value.
+
+Supplemental recovery is therefore conditional, not automatic. The current
+public build documents E.SUN as the supported secondary adapter; this document
+does not imply support for another provider or guarantee account access,
+permissions, or production activation.
 
 ## Dataset lifecycle
 
-1. A complete TWSE history creates a `canonical_complete` dataset.
-2. A qualified temporary TWSE gap can create an immutable `provisional_mixed`
-   dataset with observations from a qualified secondary provider and
-   per-observation provenance.
-3. Later TWSE observations create a new immutable reconciled child. The
-   provisional parent and its report identity are not updated in place.
-4. Equal and discrepant reconciliation outcomes remain explicit, and replay
-   of the same dataset identity is zero-write.
+- A canonical dataset contains TWSE-derived canonical research observations.
+- A provisional dataset is a bounded research result created only by the
+  qualified supplemental path. Its mixed provenance and provisional status
+  remain explicit for downstream consumers.
+- When later TWSE observations resolve a provisional gap, reconciliation creates
+  a new immutable child dataset. The provisional parent and its report identity
+  are not rewritten in place.
+- Reconciliation preserves the canonical role of TWSE. It does not turn an
+  E.SUN observation into a canonical value merely because the datasets are
+  being compared.
 
-Required coverage is derived from the frozen legal-short listing-history
-contract and authoritative listing evidence when the normal history window is
-not legally available. A normal candidate remains governed by the standard
-window; no symbol-specific hard-coded count is introduced.
+## Failure and safety behavior
 
-## Storage and compatibility
+Provider identity mismatch, malformed or incomplete data, unsupported
+credentials or permissions, normalization failure, and non-eligible provider
+errors fail closed. Only explicitly documented recoverable provider-failure
+cases may enter the bounded supplemental path, and they remain subject to the
+same identity, provenance, security, and eligibility checks.
 
-Migration `0012_dual_source_dataset_versions.sql` is additive schema v12
-support for dataset versions, observations, artifacts, and DS5 metadata. It
-does not rewrite legacy v1 rows, legacy S4 identities, or legacy reports.
+The project remains read-only and research-only. It does not place orders,
+submit brokerage instructions, automate trading, or provide investment advice.
 
-The v1 path continues to use `twse_baseline`, the frozen universe and ranking
-methodology, and the existing success/partial-success and strict-replay
-contracts. Provisional status is carried only by the v1.1 dual-source path.
-
-All examples and regression fixtures are local and deterministic. The project
-does not include production databases, market-data dumps, credentials,
-activation evidence, scheduler state, or runtime reports.
+All examples and offline regression fixtures are local and deterministic. The
+public repository does not include production databases, market-data dumps,
+credentials, scheduler state, or runtime reports.

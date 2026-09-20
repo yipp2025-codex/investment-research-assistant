@@ -2,20 +2,19 @@
 
 ## Unreleased
 
-- Clarified that dual-source resilience means TWSE canonical authority plus a
-  qualified, pluggable secondary market-data provider; E.SUN remains one
-  supported adapter rather than a permanent architectural requirement.
+- Clarified the public dual-source contract: TWSE remains canonical; E.SUN
+  may validate or provide bounded supplemental coverage only after explicit
+  eligibility checks, with no implicit fallback or canonical overwrite.
 
 ## 1.1.0 — 2026-08-13
 
 - Added resilient dual-source research datasets with TWSE canonical authority
-  and qualified E.SUN supplemental observations.
+  and qualified E.SUN supplemental observations when the documented recovery
+  conditions are satisfied.
 - Added immutable per-observation provenance, provisional datasets, and
   reconciled child datasets.
 - Added legal-short listing-history coverage derived from authoritative listing
   evidence.
-- Added additive schema v12 support through migration `0012` without rewriting
-  legacy v1 data or replay identities.
 - Added bounded redirect, credential, response-size, deadline, retry, identity,
   and artifact-safety protections with deterministic regression coverage.
 - Kept the project research-only, read-only, and free of order execution or
